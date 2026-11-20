@@ -7,7 +7,7 @@ const { layout } = require('../graph.js');
 const sync = (sha, parent, stamp = '2026/11/4 17:06:14') => ({ sha, parents: parent ? [parent] : [], author: 'Maker', date: '2026-11-04T09:06:14.000Z', subject: '[1793783174615] sync at ' + stamp });
 const human = (sha, parent, subject, author = 'xd') => ({ sha, parents: parent ? [parent] : [], author, email: 'xd@example.com', date: '2026-11-04T08:00:00.000Z', subject });
 
-test('只把 Maker 构建模板认成自动同步，正常提交不受影响', () => {
+test('只把已知构建作者的同步模板认成自动同步，正常提交不受影响', () => {
   assert.equal(timeline.isAutoCommit(sync('a')), true);
   assert.equal(timeline.isAutoCommit({ subject: '[1793783174615] sync at 2026-11-04 17:06:14', author: 'maker' }), true);
   // 同样的标题换了作者就不是构建快照
@@ -16,6 +16,22 @@ test('只把 Maker 构建模板认成自动同步，正常提交不受影响', (
   assert.equal(timeline.isAutoCommit(human('h', null, 'sync at 2026-11-04 17:06:14', 'Maker')), false);
   assert.equal(timeline.isAutoCommit(null), false);
   assert.equal(timeline.isAutoSubject('[1793783174615] sync at 2026-11-04 17:06:14'), true);
+});
+
+test('TapCode Rollback 的原始英文标题可折叠，不依赖界面中文翻译', () => {
+  const source = '[1793933663005] sync at 2026/11/6 10:54:23';
+  const commit = { sha: 't2', parents: ['t1'], author: 'TapCode Rollback', subject: source };
+  assert.equal(timeline.isAutoCommit(commit), true);
+  assert.equal(timeline.isAutoCommit({ ...commit, author: 'tapcode rollback' }), true);
+  assert.equal(timeline.isAutoCommit({ ...commit, author: 'xd' }), false);
+  assert.equal(timeline.isAutoCommit({ ...commit, subject: 'init commit' }), false);
+  assert.equal(timeline.isAutoCommit({ ...commit, subject: '[1793933663005] 同步于 2026/11/6 10:54:23' }), false);
+  const model = timeline.build([commit, { ...commit, sha: 't1', parents: ['base'], subject: '[1793932935512] sync at 2026/11/6 10:42:15' }, human('base', null, 'feat: 保留人工提交')]);
+  assert.equal(model.auto, 2);
+  assert.deepEqual(model.items.map(c => c.sha), ['auto:t2', 'base']);
+  assert.equal(model.items[0].auto.members[0].subject, source);
+  assert.equal(model.items[0].author, 'TapCode Rollback');
+  assert.deepEqual(model.items[0].parents, ['base']);
 });
 
 test('真实项目的斜杠日期、未补零时间和不带邮箱的快照都能识别', () => {

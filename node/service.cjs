@@ -3,8 +3,10 @@ const repo = require('./git.cjs');
 const team = require('./team.cjs');
 const github = require('./github.cjs');
 async function handle(method, p, secrets = {}, notify = () => {}) {
-  if (method === 'repo/snapshot') return repo.snapshot(p.dir);
+  if (method === 'repo/snapshot') return repo.snapshot({ dir: p.dir, limit: p.limit });
   if (method === 'repo/detail') return repo.detail(p.dir, p.ref);
+  if (method === 'repo/workspace-diff') return repo.workspaceDiff({ dir: p.dir }, p.limit);
+  if (method === 'repo/workspace') return repo.workspace(p.dir, p);
   if (method === 'repo/compare') return repo.compare(p.dir, p.target);
   if (method === 'repo/fetch') return repo.fetchRemote(p.dir, p.remote, notify);
   if (method === 'account/list') return github.listAccounts();

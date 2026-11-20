@@ -1,7 +1,7 @@
 (function (scope) {
   'use strict';
   // Maker 实际标题：`[1793783174615] sync at 2026/11/4 17:06:14`。
-  // 标题模板固定、作者是 Maker，所以两者一起判断；认错只影响显示，不会改动仓库。
+  // 标题模板固定、作者是 Maker 或 TapCode Rollback，所以两者一起判断。
   // 兼容斜杠/短横线及未补零的月、日、小时；不能把文档里的日期格式当真实数据。
   const SYNC_SUBJECT = /^\[\d{9,16}\]\s*sync(?:\s+at)?\s+\d{4}([/-])\d{1,2}\1\d{1,2}[ T]\d{1,2}:\d{2}/i;
   const GROUP_PREFIX = 'auto:';
@@ -13,7 +13,7 @@
     const author = String(commit.author ?? '').trim(), email = String(commit.email ?? '').trim();
     // 只有标题可用时按格式判断，拿到作者信息后再收紧一次。
     if (!author && !email) return true;
-    return /^maker$/i.test(author) || /@taptap\.(?:cn|com)$/i.test(email);
+    return /^(?:maker|tapcode rollback)$/i.test(author) || /@taptap\.(?:cn|com)$/i.test(email);
   }
   const parentsOf = commit => Array.isArray(commit.parents) ? commit.parents : [];
   // 连续的自动同步提交收成一行；其余提交原样保留。
@@ -57,6 +57,22 @@
     }
     return { items, bySha, folded, auto: autoCount, shaOf: sha => (typeof sha === 'string' && toDisplay.get(sha)) || sha };
   }
-  scope.GitTimeline = { build, isAutoCommit, isAutoSubject };
+  // Supplement the normal recent window while keeping each child before its parents.
+  function withOutgoing(commits, outgoing) {
+    const nodes = new Map();
+    for (const c of [...(commits || []), ...(outgoing || [])]) if (c?.sha && !nodes.has(c.sha)) nodes.set(c.sha, c);
+    const incoming = new Map([...nodes.keys()].map(sha => [sha, 0]));
+    for (const c of nodes.values()) for (const parent of parentsOf(c)) if (nodes.has(parent)) incoming.set(parent, incoming.get(parent) + 1);
+    const ready = [...nodes.values()].filter(c => !incoming.get(c.sha)), result = [];
+    for (let i = 0; i < ready.length; i++) {
+      const c = ready[i]; result.push(c);
+      for (const parent of parentsOf(c)) if (nodes.has(parent)) {
+        incoming.set(parent, incoming.get(parent) - 1);
+        if (!incoming.get(parent)) ready.push(nodes.get(parent));
+      }
+    }
+    return result;
+  }
+  scope.GitTimeline = { build, isAutoCommit, isAutoSubject, withOutgoing };
   if (typeof module !== 'undefined') module.exports = scope.GitTimeline;
 })(typeof window !== 'undefined' ? window : globalThis);
