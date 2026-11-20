@@ -95,11 +95,24 @@
   function loadTranslations(cache) {
     if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return;
     for (const [source, text] of Object.entries(cache)) if (source.length <= 1500 && typeof text === 'string' && text.length <= 3000 && /[\u3400-\u9fff]/u.test(text)) translations.set(source, text);
-    while (translations.size > 600) translations.delete(translations.keys().next().value);
+    // This map lives only as long as the panel. Keep successful results across
+    // refreshes and tabs: evicting them here can endlessly requeue a large page.
+    // The separately persisted Host cache keeps its existing count/byte limits.
+  }
+  // Git-generated merge titles contain identifiers, not prose to send to a model.
+  // Use the same parser for display and queue eligibility so they cannot drift.
+  function mergeSubject(value) {
+    const into = value.match(/^Merge pull request #(\d+) into ['"]?(.+?)['"]?$/);
+    if (into) return '合并更新：合入合并请求 #' + into[1] + ' 到 ' + into[2];
+    const from = value.match(/^Merge pull request #(\d+) from ([^\s]+)$/);
+    if (from) return '合并更新：合入 ' + from[2] + ' 的合并请求 #' + from[1];
+    const branch = value.match(/^Merge (remote-tracking )?branch ['"]?(.+?)['"]? into ['"]?(.+?)['"]?$/);
+    if (branch) return '合并更新：将' + (branch[1] ? '远端分支 ' : '分支 ') + branch[2] + ' 合入 ' + branch[3];
+    return '';
   }
   function needsTranslation(value) {
     const original = String(value || '');
-    if (translations.has(original) || Object.hasOwn(plain, original) || /^Merge (remote-tracking )?branch '(.+)' into (.+)$/.test(original)) return false;
+    if (translations.has(original) || Object.hasOwn(plain, original) || mergeSubject(original)) return false;
     const m = original.match(/^([a-z]+)(?:\(([^)]+)\))?(!)?:\s*(.*)$/s);
     if (m && Object.hasOwn(types, m[1])) {
       if (m[2] && !Object.hasOwn(areas, m[2]) && /[a-z]/i.test(m[2])) return true;
@@ -115,11 +128,15 @@
   }
   function subject(value) {
     const original = String(value || '');
+    const merged = mergeSubject(original);
+    if (merged) return merged;
     // 部分模型保留了英文提交前缀，显示时仍统一翻译类型与已知模块。
-    const display = translations.get(original) || original;
+    const cached = translations.get(original);
+    // Only unwrap a quoted destination identifier; prose quotes stay intact.
+    const display = cached ? cached.replace(/(到\s+)(['"])([\w./@-]+)\2/g, '$1$3') : original;
     if (Object.hasOwn(plain, display)) return plain[display];
-    const merge = display.match(/^Merge (remote-tracking )?branch '(.+)' into (.+)$/);
-    if (merge) return '合并更新：将' + (merge[1] ? '远端分支 ' : '分支 ') + merge[2] + ' 合入 ' + merge[3];
+    const merge = mergeSubject(display);
+    if (merge) return merge;
     const m = display.match(/^([a-z]+)(?:\(([^)]+)\))?(!)?[:：]\s*(.*)$/s);
     if (!m || !Object.hasOwn(types, m[1])) return display;
     const area = m[2] ? '（' + (Object.hasOwn(areas, m[2]) ? areas[m[2]] : m[2]) + '）' : '';
@@ -132,6 +149,75 @@
     const changes = { M: '修改', A: '新增', D: '删除', R: '重命名', C: '复制', T: '类型改变', U: '冲突' };
     return [...code].map((c, i) => changes[c] ? (i === 0 ? '已暂存' : '未暂存') + changes[c] : '').filter(Boolean).join('、') || '有改动';
   }
-  scope.GitLabels = { subject, fileStatus, needsTranslation, loadTranslations };
+  function stashInfo(stash) {
+    const translated = value => translations.get(value) || subject(value);
+    const sourceFor = value => value && value.length <= 1500 && !/[\u3400-\u9fff]/u.test(value) && needsTranslation(value) ? value : '';
+    const raw = String(stash?.subject || ''), match = raw.match(/^(WIP on|index on|On)\s+([^:]+):\s*(.*)$/i);
+    const branch = match?.[2]?.trim() || '', body = (match ? match[3] : raw).trim();
+    if (/^local-upgrade-(?:\d{8}-)?preserve-existing-work$/i.test(body) || /^(?:local-)?upgrade[-_].*(?:preserve[-_]existing[-_]work|auto[-_]backup)$/i.test(body)) return { title: '升级前自动保留的本地改动', subtitle: '', branch, auto: true, raw, source: '' };
+    if (/^[a-z0-9][a-z0-9._-]*$/i.test(body) && ((body.match(/-/g) || []).length >= 2 || body.length > 32)) return { title: '工作区备份', subtitle: '标识 ' + body.slice(0,28) + '…', branch, auto: false, raw, source: '' };
+    const base = body.match(/^([0-9a-f]{6,40})\s+(.*)$/i);
+    if (/^(?:WIP on|index on)$/i.test(match?.[1] || '') || base) {
+      const baseSubject = base ? base[2] : body;
+      const autoBase = /\[\d{9,16}\]\s*sync/i.test(baseSubject);
+      return { title: '临时备份', subtitle: !baseSubject ? '' : autoBase ? '基于自动同步快照' : '基于：' + translated(baseSubject), branch, auto: false, raw, source: autoBase ? '' : sourceFor(baseSubject) };
+    }
+    if (/^\[\d{9,16}\]\s*sync\b/i.test(body)) return { title: '自动同步快照', subtitle: '', branch, auto: false, raw, source: '' };
+    return { title: body ? translated(body) : '本地备份', subtitle: '', branch, auto: false, raw, source: sourceFor(body) };
+  }
+  function stageFileBadge(file, stage) {
+    if (file.conflict) return '冲突';
+    if (file.untracked || file.status === '??') return '新文件';
+    const status = String(file.status || '');
+    const code = stage === 'staged' ? status[0] : stage === 'unstaged' ? status[1] || status[0] : status.replace(/[. ?]/g, '')[0];
+    return ({A:'新增',D:'删除',R:'重命名',C:'新增',U:'冲突',T:'修改',M:'修改'})[code] || '修改';
+  }
+  const lineCount = value => Number.isFinite(value) && value >= 0 ? value : null;
+  function workspaceModule(path) {
+    const name = String(path || '').replace(/\\/g, '/'), base = name.split('/').pop();
+    if (/(?:^|\/)tests?\//i.test(name) || /\.test\./i.test(base)) return '自动化测试';
+    if (/\.css$/i.test(base)) return '样式与视觉';
+    if (/^(timeline|graph)\.js$/.test(base)) return '流线与图形布局';
+    if (base === 'labels.js') return '中文说明与标签';
+    if (/^(panel-repos\.js|github\.cjs)$/.test(base)) return '仓库与账号管理';
+    if (/^(team\.cjs|fetch-schedule\.js)$/.test(base)) return '团队协作与同步';
+    if (/^(main\.js|bridge\.js)$/.test(base) || /(?:^|\/)node\/(?:git|service|command|worker)\.cjs$/.test(name)) return 'Git 读取与后台服务';
+    if (/^panel(?:-[\w-]+)?\.(?:js|html)$/.test(base) || /(?:^|\/)(?:ui|components?|views?|pages?)(?:\/|\.)/i.test(name) || /\.(?:html|tsx|jsx|vue|svelte)$/i.test(base)) return '界面与交互';
+    if (/\.md$/i.test(base) || /^(?:ghost|package)\.json$/.test(base)) return '项目配置与文档';
+    if (name.split('/').some(segment => segment.startsWith('.'))) return '配置与工具文件';
+    const words = name.toLowerCase().split(/[^a-z0-9]+/);
+    for (const word of words) if (Object.hasOwn(areas, word)) return areas[word];
+    return name.includes('/') ? name.split('/')[0] || '项目文件' : '项目文件';
+  }
+  function workspaceSummary(status) {
+    const files = Array.isArray(status?.files) ? status.files : [], count = lineCount(status?.count) ?? files.length;
+    const sum = key => files.reduce((total, f) => total + (lineCount(f[key]) ?? 0), 0);
+    const additions = lineCount(status?.additions) ?? (files.some(f => lineCount(f.add) !== null) ? sum('add') : null);
+    const deletions = lineCount(status?.deletions) ?? (files.some(f => lineCount(f.remove) !== null) ? sum('remove') : null);
+    const untracked = lineCount(status?.untracked) ?? files.filter(f => f.untracked || f.status === '??').length;
+    const statsText = count + ' 个文件' + ((additions ?? 0) + (deletions ?? 0) > 0 ? ' · +' + (additions ?? 0) + ' / -' + (deletions ?? 0) + ' 行' : '') + (untracked ? ' · 含 ' + untracked + ' 个新文件' : '');
+    const groups = new Map();
+    for (const f of files) {
+      const key = workspaceModule(f.path), group = groups.get(key) || {count:0, added:0, removed:0, renamed:0, add:0, remove:0};
+      group.count++; const badge = stageFileBadge(f);
+      if (badge === '新增' || badge === '新文件') group.added++; else if (badge === '删除') group.removed++; else if (badge === '重命名') group.renamed++;
+      group.add += lineCount(f.add) ?? 0; group.remove += lineCount(f.remove) ?? 0;
+      groups.set(key, group);
+    }
+    const ordered = [...groups.entries()].sort((a,b) => b[1].count - a[1].count);
+    const headline = count ? '主要涉及 ' + (ordered.slice(0,3).map(([name]) => name).join('、') || '项目文件') : '工作区没有未提交改动';
+    const bullets = ordered.slice(0,4).map(([name,g]) => {
+      const parts = [];
+      if (g.added) parts.push('新增 ' + g.added + ' 个');
+      if (g.removed) parts.push('删除 ' + g.removed + ' 个');
+      if (g.renamed) parts.push('重命名 ' + g.renamed + ' 个');
+      const updated = g.count - g.added - g.removed - g.renamed;
+      if (updated) parts.push('修改 ' + updated + ' 个');
+      return name + '：' + parts.join('、') + (name === '自动化测试' ? '测试文件' : '文件') + (g.add + g.remove > 0 ? '（+' + g.add + ' / -' + g.remove + ' 行）' : '');
+    });
+    if (count && bullets.length < 2) bullets.push(untracked ? '包含 ' + untracked + ' 个新文件，尚未加入版本记录' : '这些改动保留在本机，尚未写入提交记录');
+    return {headline, statsText, bullets};
+  }
+  scope.GitLabels = { subject, fileStatus, needsTranslation, loadTranslations, stashInfo, workspaceSummary, stageFileBadge };
   if (typeof module !== 'undefined') module.exports = scope.GitLabels;
 })(typeof window !== 'undefined' ? window : globalThis);
