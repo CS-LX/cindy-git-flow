@@ -4,17 +4,22 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':
 const icon = name => '<svg aria-hidden="true"><use href="#i-' + name + '"/></svg>';
 const rpc = GitBridge.request;
 let translationBusy = false, translationError = '', activeCommitSubject = '';
+let translationStalled = new Set();
 // Keep the actual change readable while translation is pending or unavailable.
-const subjectLabel = value => GitLabels.subject(value);
+const subjectLabel = value => config.showOriginal === true ? String(value ?? '') : GitLabels.subject(value);
 const fetchSchedule = new GitFetchSchedule.FetchSchedule(), fetchErrors = new Map(), fetchProgress = new Map(), fetchSuccessAt = new Map();
-let autoFetchMinutes = 5, timelineScope = 'all';
+let autoFetchMinutes = 5, timelineScope = 'all', timelineLimit = 180;
+let localFlowCollapsed = false;
+let localFlowMarkup = '';
 const noCommits = [];
-let displaySource = null, displayFold = null, display = null;
+let displaySource = null, displayFold = null, display = null, displayOutgoing = null;
+let outgoingActive = false, outgoingContext = '';
 // 折叠只影响显示：原始提交仍来自 state，换开关时重新构建，不重新读 Git。
 function displayModel() {
   const source = timelineScope === 'current' ? state?.currentCommits || noCommits : state?.commits || noCommits;
-  const fold = config.foldAuto !== false;
-  if (source !== displaySource || fold !== displayFold) { displaySource = source; displayFold = fold; display = GitTimeline.build(source, { fold }); }
+  const fold = config.foldAuto !== false && !outgoingActive;
+  const outgoing = outgoingActive ? state?.outgoingCommits : null;
+  if (source !== displaySource || fold !== displayFold || outgoing !== displayOutgoing) { displaySource = source; displayFold = fold; displayOutgoing = outgoing; display = GitTimeline.build(outgoing ? GitTimeline.withOutgoing(source, outgoing) : source, { fold }); }
   return display;
 }
 const visibleCommits = () => displayModel().items;
@@ -53,6 +58,7 @@ function clock(value) {
 }
 function autoTitle(row) {
   if (row.auto?.folded) return '自动同步 ×' + row.auto.count;
+  if (config.showOriginal === true) return String(row.subject ?? '');
   const time = clock(row.date);
   return '自动同步' + (time ? ' · ' + time : '');
 }
@@ -66,7 +72,7 @@ function autoRange(row) {
 const refLabel = ref => GitTimeline.isAutoCommit(ref) ? autoTitle(ref) : subjectLabel(ref.subject);
 function error(message) { $('#error').textContent = message || ''; $('#error').hidden = !message; renderAttention(); }
 function renderAttention() {
-  const issue = !$('#error').hidden || !!translationError || !$('#preferences-toggle .sync-dot').hidden;
+  const issue = !$('#error').hidden || (config.showOriginal !== true && !!translationError) || !$('#preferences-toggle .sync-dot').hidden;
   $('#pull-handle .attention-dot').hidden = !issue;
   renderScope();
   $('#pull-handle').title = controlsCollapsed ? (issue ? '有更新提示 · 点击或向下拖动查看' : '点击或向下拖动，展开工具栏') : '点击或向上拖动，收起工具栏';
@@ -118,6 +124,7 @@ function options() {
   $('#motion').title = config.motion === false ? '开启路径流光，方便追踪选中提交的历史' : '关闭路径流光';
   $('#auto-sync').setAttribute('aria-pressed', String(config.foldAuto !== false));
   $('#auto-sync').title = config.foldAuto === false ? '已关闭折叠 · 每条自动同步单独显示' : '已开启折叠 · 连续自动同步合成一行，点击可看快照';
+  $('#show-original').setAttribute('aria-pressed', String(config.showOriginal === true));
   const nextMinutes = GitFetchSchedule.minutes(config.autoFetchMinutes);
   if (nextMinutes !== autoFetchMinutes) fetchSchedule.reconfigure(nextMinutes * 60000);
   autoFetchMinutes = nextMinutes;
@@ -126,18 +133,39 @@ function options() {
   renderFetchStatus();
 }
 function untranslatedSubjects() {
+  if (config.showOriginal === true || !state) return [];
+  // Match what each page actually renders; branch labels on the graph do not
+  // display ref subjects, and hidden pages must not keep feeding the queue.
+  const candidates = !$('#detail').hidden ? [{ subject: activeCommitSubject }]
+    : tab === 'branches' ? [...branchRefs(false), ...branchRefs(true)]
+    : tab === 'team' ? (config.teamUrl && config.teamRepos?.[dir]?.enabled ? team?.members || [] : [])
+    : [...visibleCommits()];
+  const backupsVisible = (workspaceView && !$('#detail').hidden) || (tab === 'timeline' && $('#detail').hidden && !$('#local-flow').hidden && !localFlowCollapsed);
+  if (backupsVisible) for (const stash of state.stashes || []) {
+    const source = GitLabels.stashInfo(stash).source;
+    if (source) candidates.push({subject:source});
+  }
   // 构建快照的标题是机器文案，不值得花一次模型调用去翻译。
-  return [...new Set([...visibleCommits(), ...(state?.refs || []), ...(team?.members || []), { subject: activeCommitSubject }].filter(c => !GitTimeline.isAutoCommit(c)).map(c => c.subject).filter(s => s && s.length <= 1500 && GitLabels.needsTranslation(s)))];
+  return [...new Set(candidates.filter(c => !GitTimeline.isAutoCommit(c)).map(c => c.subject).filter(s => s && s.length <= 1500 && !translationStalled.has(s) && GitLabels.needsTranslation(s)))];
 }
 function renderTranslationStatus() {
   const missing = untranslatedSubjects().length;
-  $('#translation-row').hidden = !missing;
-  $('#translation-status').textContent = translationError || (translationBusy ? '正在生成中文说明…' : '等待生成中文说明…');
-  $('#retry-translation').hidden = !translationError;
+  const stalled = config.showOriginal !== true && state ? translationStalled.size : 0;
+  $('#translation-row').hidden = !missing && !stalled;
+  $('#translation-status').textContent = !missing && stalled ? stalled + ' 条标题暂时无法翻译' : translationError || (translationBusy ? '正在生成中文说明…' : '等待生成中文说明…');
+  $('#retry-translation').hidden = !translationError && !(stalled && !missing);
   $('#retry-translation').disabled = translationBusy; renderAttention();
 }
 function repaintTranslations() {
   if (!state) return;
+  renderLocalFlow();
+  if (workspaceView && !$('#detail').hidden) for (const [index,stash] of workspaceView.stashes.entries()) {
+    const info = GitLabels.stashInfo(stash);
+    const title = $('#detail-body').querySelector('[data-stash-title="' + index + '"]');
+    if (title) title.textContent = config.showOriginal === true ? info.raw : info.title;
+    const subtitle = $('#detail-body').querySelector('[data-stash-subtitle="' + index + '"]');
+    if (subtitle) { subtitle.textContent = info.subtitle; subtitle.hidden = config.showOriginal === true || !info.subtitle; }
+  }
   const scroll = $('#graph-scroll'), top = scroll.scrollTop;
   const anchor = geometry?.elements.find(el => el.offsetTop + el.offsetHeight > top);
   const sha = anchor?.dataset.sha, offset = anchor ? top - anchor.offsetTop : 0;
@@ -151,12 +179,18 @@ function repaintTranslations() {
   if (!$('#detail').hidden && activeCommitSubject) {
     $('#detail-title').textContent = subjectLabel(activeCommitSubject);
     const title = $('#detail-body .patch-head .msg');
-    if (title) title.textContent = subjectLabel(activeCommitSubject);
+    if (title) {
+      title.textContent = subjectLabel(activeCommitSubject);
+      const original = $('#detail-body .original-subject');
+      if (subjectLabel(activeCommitSubject) === activeCommitSubject) original?.remove();
+      else if (!original) title.insertAdjacentHTML('afterend', originalSubject(activeCommitSubject));
+    }
   }
   renderTranslationStatus();
 }
 async function translatePending(retry = false) {
   if (translationBusy || (translationError && !retry) || document.hidden) return;
+  if (retry === true) { translationStalled.clear(); translationError = ''; }
   const pending = untranslatedSubjects();
   if (!pending.length) { renderTranslationStatus(); return; }
   const subjects = []; let size = 0;
@@ -164,15 +198,24 @@ async function translatePending(retry = false) {
     if (subjects.length === 20 || size + source.length > 16000) break;
     subjects.push(source); size += source.length;
   }
-  translationBusy = true; translationError = ''; const revision = generation, requestDir = dir;
+  const requested = [...subjects];
+  let progressed = false;
+  translationBusy = true; translationError = ''; const revision = generation, requestDir = dir, requestOriginal = config.showOriginal;
   renderTranslationStatus();
   try {
     const result = await rpc('text/translate', { subjects, retry });
-    GitLabels.loadTranslations(result.translations);
+    GitLabels.loadTranslations(result?.translations);
+    if (revision === generation && requestDir === dir && requestOriginal === config.showOriginal) {
+      for (const source of requested) {
+        const value = result?.translations && Object.hasOwn(result.translations,source) ? result.translations[source] : null;
+        if (typeof value === 'string' && value.trim() && !GitLabels.needsTranslation(source)) progressed = true;
+        else translationStalled.add(source);
+      }
+    }
     if (revision === generation && requestDir === dir) repaintTranslations();
-  } catch (e) { translationError = e.message; repaintTranslations(); }
+  } catch (e) { if (revision === generation && requestDir === dir) { translationError = e.message; repaintTranslations(); } }
   finally { translationBusy = false; renderTranslationStatus(); }
-  if (!translationError) translatePending();
+  if (!translationError && progressed) return translatePending();
 }
 function renderFollow() {
   $('#follow-session').disabled = repositoryLocked || lockSaving;
@@ -187,11 +230,16 @@ function renderFollow() {
   $('#repository-lock use').setAttribute('href', repositoryLocked ? '#i-lock' : '#i-unlock');
 }
 function clearRepository(title, message) {
+  translationStalled.clear();
+  modelSummary = null; modelSummaryContext = '';
+  translationError = '';
+  outgoingActive = false; outgoingContext = ''; workspaceView = null;
+  $('#tracking-row').hidden = true; $('#stash-pill').hidden = true; $('#local-flow').hidden = true;
   ++generation; ++teamGeneration; ++detailRevision;
   state = null; dir = null; busy = false; connecting = false; selected = null;
   repositoryWorkdir = null; connectingWorkdir = null;
   team = null; teamError = ''; teamEditing = false; nextTeamAt = 0; teamFailures = 0;
-  activeCommitSubject = ''; graphKey = ''; timelineScope = 'all';
+  activeCommitSubject = ''; graphKey = ''; timelineScope = 'all'; localFlowCollapsed = false;
   GitChoices.close(); showPreferences(false); $('#detail').hidden = true; $('#sheet').hidden = true;
   $('#searchbar').hidden = true; $('#search-toggle').setAttribute('aria-expanded', 'false'); $('#search').value = '';
   $('#graph').replaceChildren(); $('#branches').replaceChildren(); $('#team').replaceChildren();
@@ -233,7 +281,9 @@ async function connect(nextDir, pick = false, mode = 'manual', focus = activeFoc
     if (!data) { followingSession = previousFollowing; options(); render(); return; }
     const latest = await rpc('config/read');
     if (revision !== generation) return;
-    dir = data.dir; state = data; config = latest; repositoryLocked = !!config.repositoryLock?.dir; if (repositoryLocked) followingSession = false; timelineScope = 'all'; selected = null;
+    if (dir !== data.dir) translationStalled.clear();
+    if (dir !== data.dir || state?.head !== data.head || state?.branch !== data.branch) { modelSummary = null; modelSummaryContext = ''; }
+    dir = data.dir; state = data; config = latest; repositoryLocked = !!config.repositoryLock?.dir; if (repositoryLocked) followingSession = false; timelineScope = 'all'; timelineLimit = 180; localFlowCollapsed = false; selected = null;
     repositoryWorkdir = workdirKey(pick ? data.dir : nextDir);
     teamEditing = false; team = null; teamError = ''; nextTeamAt = 0; graphKey = '';
     options(); render(); syncTeam();
@@ -260,7 +310,7 @@ async function refresh(fetchRemote = false, automatic = false) {
   if (fetchRemote) { fetchProgress.delete(fetchSchedule.key(requestedDir, remote)); $('#remote-select').disabled = true; renderFetchStatus(); }
   let success = false;
   try {
-    const result = await rpc(fetchRemote ? 'repo/fetch' : 'repo/snapshot', { dir: requestedDir, remote });
+    const result = await rpc(fetchRemote ? 'repo/fetch' : 'repo/snapshot', { dir: requestedDir, remote, limit: timelineLimit });
     success = true;
     if (fetchRemote) { fetchErrors.delete(fetchSchedule.key(requestedDir, remote)); fetchSuccessAt.set(fetchSchedule.key(requestedDir, remote), result.fetchCompletedAt || new Date().toISOString()); }
     if (revision === generation) { state = result; render(); }
@@ -281,6 +331,15 @@ async function maybeFetch() {
   if (!fetchSchedule.due(dir, remote, autoFetchMinutes)) return false;
   await refresh(true, true);
   return true;
+}
+async function loadMoreHistory() {
+  if (!dir || busy || !(timelineScope === 'current' ? state?.currentTruncated : state?.truncated)) return;
+  busy = true; renderFollow(); const revision = generation, requestedDir = dir;
+  try {
+    const result = await rpc('repo/snapshot', { dir: requestedDir, limit: timelineLimit + 180 });
+    if (revision === generation && requestedDir === dir) { timelineLimit += 180; state = result; render(); }
+  } catch (e) { if (revision === generation) error(e.message); }
+  finally { if (revision === generation) { busy = false; renderFollow(); } }
 }
 async function tick() {
   if (document.hidden) return;
@@ -319,6 +378,9 @@ function renderFetchStatus() {
 }
 
 function renderStatus() {
+  const context = JSON.stringify([state.dir, state.branch, state.upstream]);
+  if (context !== outgoingContext) { outgoingActive = false; outgoingContext = context; }
+  if (!state.upstream || state.upstreamExists === false || !state.ahead || !state.outgoingCommits?.length) outgoingActive = false;
   const branch = state.branch || (state.unborn ? '尚无提交' : '游离提交 ' + short(state.head));
   $('#current-branch').textContent = branch;
   $('#current-branch').title = '当前分支：' + branch + ' · 点击定位';
@@ -330,9 +392,19 @@ function renderStatus() {
   dirty.innerHTML = count ? '<b>' + count + '</b> 个改动' + (state.status.conflicts ? ' · 冲突 ' + state.status.conflicts : '') : '无改动';
   dirty.title = count ? count + ' 个文件尚未提交，点击查看' : '工作区没有未提交的文件';
   const ahead = $('#ahead'), behind = $('#behind');
-  ahead.hidden = !state.ahead; behind.hidden = !state.behind;
-  ahead.className = 'pill good'; ahead.innerHTML = '↑ <b>' + (state.ahead || 0) + '</b>'; ahead.title = (state.ahead || 0) + ' 个提交待推送';
+  ahead.hidden = !state.upstream || state.upstreamExists === false; behind.hidden = !state.behind;
+  ahead.disabled = !state.ahead || !state.outgoingCommits?.length;
+  ahead.setAttribute('aria-pressed', String(outgoingActive));
+  ahead.className = 'pill good'; ahead.innerHTML = '↑ <b>' + (state.ahead || 0) + '</b>'; ahead.title = (state.ahead || 0) + ' 个提交待推送' + (outgoingActive ? ' · 再点取消高亮' : ' · 点击定位全部');
+  ahead.setAttribute('aria-label', ahead.title);
   behind.className = 'pill warn'; behind.innerHTML = '↓ <b>' + (state.behind || 0) + '</b>'; behind.title = (state.behind || 0) + ' 个提交待拉取';
+  $('#tracking-row').hidden = false;
+  const tracking = $('#branch-tracking'); tracking.hidden = false;
+  tracking.textContent = state.upstream ? '上游 ' + state.upstream + (state.upstreamExists === false ? ' · 远端记录缺失' : '') : '未设置上游';
+  tracking.title = state.upstream ? '相对上游的待推送数量；远端状态以最近获取为准' : '设置上游后可查看待推送数量';
+  const stashes = state.stashes || [];
+  $('#stash-pill').hidden = !stashes.length;
+  $('#stash-pill').innerHTML = '备份 <b>' + stashes.length + '</b>';
   renderRemote();
 }
 function renderRemote() {
@@ -350,10 +422,14 @@ function render() {
   $('#overview').hidden = !state; $('#viewbar').hidden = !state; $('#pull-handle').hidden = !state;
   $('#preferences-toggle').disabled = !state;
   if (!state) return;
+  syncModelSummaryContext();
+  if (workspaceView && (workspaceView.head !== state.head || workspaceView.branch !== state.branch)) closeDetail();
   renderStatus(); renderScope();
+  renderLocalFlow();
+  renderModelSummary();
   if (state.unstable) error('仓库正在被其他操作更新，当前快照可能变化，请稍后刷新。');
   $('#branch-count').textContent = state.refs.length;
-  const key = JSON.stringify([state.dir, state.head, state.refs, timelineScope, visibleCommits()]);
+  const key = JSON.stringify([state.dir, state.head, state.refs, timelineScope, outgoingActive, state.outgoingTruncated, state.ahead, visibleCommits()]);
   if (key !== graphKey) {
     graphKey = key;
     // 开关折叠后选中项可能落进行号里：能跟就跟过去，跟不上才取消。
@@ -363,6 +439,7 @@ function render() {
   }
   if (tab === 'branches') renderBranches();
   if (tab === 'team') renderTeam();
+  filterGraph();
   renderTranslationStatus(); translatePending();
 }
 
@@ -395,24 +472,28 @@ let geometry = null;
 function renderGraph() {
   const host = $('#graph');
   const commits = visibleCommits();
-  if (!commits.length) { graph = null; geometry = null; host.innerHTML = '<p class="empty">' + (timelineScope === 'current' ? '当前分支尚无提交。' : '首次提交后，分支故事从这里开始。') + '</p>'; $('#graph-foot').textContent = ''; renderSheet(); return; }
+  if (!commits.length) { graph = null; geometry = null; host.innerHTML = '<p class="empty">' + (timelineScope === 'current' ? '当前分支尚无提交。' : '首次提交后，分支故事从这里开始。') + '</p>'; $('#graph-foot').textContent = ''; $('#load-more').hidden = true; renderSheet(); return; }
   graph = GitGraph.layout(commits);
   const width = host.clientWidth || innerWidth;
   const spacing = Math.max(13, Math.min(18, (width * 0.42 - 22) / graph.lanes));
   const x = lane => 22 + lane * spacing;
   host.innerHTML = graph.rows.map(row => {
     const head = row.sha === headSha(), folded = !!row.auto?.folded;
-    const hint = folded ? '连续 ' + row.auto.count + ' 条 Maker 构建快照，点击挑选一条查看改动' : row.auto ? 'Maker 构建自动生成的快照提交' : '提交作者：' + row.author + '（提交时填写的 Git 姓名，不是账号认证）';
+    const hint = folded ? '连续 ' + row.auto.count + ' 条自动同步快照，点击挑选一条查看改动' : row.auto ? '自动同步快照 · 提交作者：' + row.author : '提交作者：' + row.author + '（提交时填写的 Git 姓名，不是账号认证）';
     const when = folded ? autoRange(row) : age(row.date);
-    return '<button class="commit-row' + (head ? ' head' : '') + (row.auto ? ' auto' : '') + (folded ? ' folded' : '') + '" data-sha="' + row.sha + '" title="' + escapeHtml(row.auto ? row.subject : subjectLabel(row.subject)) + '"><div class="commit-title">' + escapeHtml(row.auto ? autoTitle(row) : subjectLabel(row.subject)) + '</div><div class="commit-meta">' + chips(row, 2) + '<span class="author" title="' + escapeHtml(hint) + '">' + escapeHtml(row.auto ? 'Maker' : row.author || '') + '</span><span class="dot">·</span><span class="when">' + escapeHtml(when || '') + '</span></div></button>';
+    return '<button class="commit-row' + (head ? ' head' : '') + (row.auto ? ' auto' : '') + (folded ? ' folded' : '') + '" data-sha="' + row.sha + '" title="' + escapeHtml(row.auto ? row.subject : subjectLabel(row.subject)) + '"><div class="commit-title">' + escapeHtml(row.auto ? autoTitle(row) : subjectLabel(row.subject)) + '</div><div class="commit-meta">' + chips(row, 2) + '<span class="author" title="' + escapeHtml(hint) + '">' + escapeHtml(row.author || '') + '</span><span class="dot">·</span><span class="when">' + escapeHtml(when || '') + '</span></div></button>';
   }).join('');
   const elements = [...host.querySelectorAll('.commit-row')];
   elements.forEach((el, i) => el.style.setProperty('--indent', Math.round(x(graph.reach[i]) + 16 - 8) + 'px'));
   geometry = { x, y: elements.map(el => el.offsetTop + 20), height: host.scrollHeight, elements };
   drawGraph();
   const folded = displayModel().folded;
-  $('#graph-foot').textContent = (timelineScope === 'current' ? (state.detached ? '当前提交' : '当前分支') : '全仓库') + ' · ' + commits.length + ' 条提交' + (folded ? ' · 已折叠 ' + folded + ' 条自动同步' : '') + ((timelineScope === 'current' ? state.currentTruncated : state.truncated) ? ' · 虚线连接更早的记录' : ' · 点击看摘要，再点查看改动');
+  $('#graph-foot').textContent = '仓库历史 · ' + (timelineScope === 'current' ? (state.detached ? '当前提交' : '当前分支') : '全仓库') + ' · ' + commits.length + ' 条提交' + (folded ? ' · 已折叠 ' + folded + ' 条自动同步' : '') + ((timelineScope === 'current' ? state.currentTruncated : state.truncated) ? ' · 虚线连接更早的记录' : ' · 点击看摘要，再点查看改动');
   filterGraph(); renderSheet();
+  const canLoadMore = timelineScope === 'current' ? state.currentTruncated : state.truncated;
+  $('#load-more').hidden = !canLoadMore || busy;
+  $('#load-more').textContent = '加载更早的提交（当前 ' + commits.length + ' 条）';
+  if (outgoingActive) $('#graph-foot').textContent += ' · 已突出 ' + state.outgoingCommits.length + ' 条待推送（含窗口外记录，自动同步暂时逐条展开）' + (state.outgoingTruncated ? ' · 仅加载前 ' + state.outgoingCommits.length + ' 条，共 ' + state.ahead + ' 条待推送' : '');
 }
 // 折线拐点做小圆角，线条读起来更顺。
 function polyline(points, radius = 7) {
@@ -465,10 +546,14 @@ function drawGraph() {
 function filterGraph() {
   if (!graph) return;
   const q = $('#search').value.trim().toLowerCase();
+  const outgoingShas = new Set(outgoingActive ? (state.outgoingCommits || []).map(c => c.sha) : []);
   geometry.elements.forEach((el, i) => {
     const c = graph.rows[i];
-    const haystack = [c.sha, c.subject, c.auto ? '自动同步 Maker' + (c.auto.count > 1 ? ' 折叠 ' + c.auto.count + ' 条' : '') : subjectLabel(c.subject), c.author, ...state.refs.filter(r => rowSha(r.sha) === c.sha).map(r => r.name)].join(' ').toLowerCase();
-    el.classList.toggle('dimmed', !!q && !haystack.includes(q));
+    const haystack = [c.sha, c.subject, c.auto ? '自动同步 Maker TapCode Rollback' + (c.auto.count > 1 ? ' 折叠 ' + c.auto.count + ' 条' : '') : GitLabels.subject(c.subject), c.author, ...state.refs.filter(r => rowSha(r.sha) === c.sha).map(r => r.name)].join(' ').toLowerCase();
+    const members = c.auto?.members || [c];
+    const outgoing = members.some(m => outgoingShas.has(m.sha));
+    el.classList.toggle('outgoing-match', outgoing);
+    el.classList.toggle('dimmed', !outgoing && !!q && !haystack.includes(q));
     el.classList.toggle('search-match', !!q && haystack.includes(q));
   });
 }
@@ -488,7 +573,7 @@ function renderSheet() {
   if (row.auto?.folded) {
     // 折叠行不是一次真实提交，列出它包含的快照，而不是显示一份假补丁。
     sheet.innerHTML = '<div class="sheet-head"><div class="sheet-title">自动同步 · ' + row.auto.count + ' 条提交</div><button class="icon-button" data-sheet="close" title="关闭" aria-label="关闭">' + icon('close') + '</button></div>' +
-      '<div class="sheet-meta"><span>Maker 构建推送的快照</span><span>' + escapeHtml(autoRange(row)) + '</span>' + (head ? '<span>当前提交</span>' : '') + '</div>' +
+      '<div class="sheet-meta"><span>自动同步快照</span><span>' + escapeHtml(autoRange(row)) + '</span>' + (head ? '<span>当前提交</span>' : '') + '</div>' +
       (refs.length ? '<div class="sheet-refs">' + chips(row, 6) + '</div>' : '') +
       '<p class="auto-note">每次构建都会留下一条快照，默认折成一行。点任意一条查看它的改动；不想折叠可以在「远端与显示」里关闭。</p>' +
       '<div class="auto-list">' + row.auto.members.map(m => '<button class="auto-item" data-commit="' + m.sha + '" title="' + escapeHtml(m.subject) + '"><span class="mono">' + short(m.sha) + '</span><span class="auto-time">' + escapeHtml(clock(m.date)) + '</span></button>').join('') + '</div>';
@@ -500,10 +585,11 @@ function renderSheet() {
     (row.auto ? '' : originalSubject(row.subject)) + '<div class="sheet-actions"><button class="main" data-sheet="detail" title="查看这次提交修改了哪些文件和代码">查看改动</button>' + (head ? '' : '<button data-sheet="compare" title="只查看提交数量和文件差异，不执行合并或切换">和当前分支比较</button>') + '</div>';
 }
 
+function branchRefs(remote) { return (state?.refs || []).filter(r => r.remote === remote); }
 function renderBranches() {
   let html = '';
   for (const remote of [false, true]) {
-    const refs = state.refs.filter(r => r.remote === remote);
+    const refs = branchRefs(remote);
     html += '<div class="section-label">' + (remote ? '远端分支（本机缓存）' : '本地分支') + '<span>' + refs.length + '</span></div>';
     for (const r of refs) {
       const current = r.full === 'refs/heads/' + state.branch;
@@ -511,7 +597,15 @@ function renderBranches() {
       html += '<div class="branch-item"><span class="branch-dot' + (remote ? '' : ' local') + '"></span><div class="branch-main"><div class="branch-name"><span>' + escapeHtml(r.name) + '</span>' + (current ? '<span class="chip here"><span>当前</span></span>' : '') + '</div><div class="branch-description" title="' + escapeHtml(refLabel(r)) + '">' + escapeHtml(refLabel(r)) + '</div><div class="branch-meta">' + escapeHtml(r.author) + ' · ' + age(r.date) + (worktrees.length ? ' · 已在 ' + worktrees.length + ' 个本机工作区检出' : '') + '</div></div><div class="branch-actions"><button class="text-button" data-locate="' + r.sha + '" title="在提交图中找到分支指向的最新提交">定位</button>' + (current ? '' : '<button class="text-button" data-compare="' + escapeHtml(r.full) + '" title="查看与当前分支的差距和文件差异，不执行合并或切换">比较</button>') + '</div></div>';
     }
   }
-  $('#branches').innerHTML = html;
+  const tracking = '<div class="branch-tracking">' + escapeHtml(state.upstream ? '当前分支上游 ' + state.upstream + (state.upstreamExists === false ? ' · 远端记录缺失' : '') : '当前分支未设置上游') + (state.upstream && state.upstreamExists !== false ? ' · <button class="text-button" data-outgoing aria-pressed="' + outgoingActive + '"' + (!state.ahead || !state.outgoingCommits?.length ? ' disabled' : '') + '>↑ ' + (state.ahead || 0) + ' 待推送</button>' : '') + '</div>';
+  $('#branches').innerHTML = tracking + html;
+}
+function toggleOutgoing() {
+  if (!state?.upstream || state.upstreamExists === false || !state.ahead || !state.outgoingCommits?.length) return;
+  outgoingActive = !outgoingActive; selected = null; graphKey = '';
+  if (outgoingActive) { $('#search').value = ''; error(''); }
+  switchTab('timeline'); render();
+  if (outgoingActive) geometry?.elements.find(el => el.classList.contains('outgoing-match'))?.scrollIntoView({ block: 'center', behavior: config.motion === false ? 'auto' : 'smooth' });
 }
 function locate(sha) {
   // 折叠后真正的提交编号不是一行，先换到它所在的那一行再定位。
@@ -543,7 +637,7 @@ function renderTeam() {
         const elapsed = team.serverTime + performance.now() - team.receivedMonotonic - m.seenAt;
         const online = !teamError && elapsed < 90000;
         const known = [...state.commits, ...(state.currentCommits || [])].some(c => c.sha === m.head);
-        html += '<button class="person"' + (known ? ' data-locate="' + escapeHtml(m.head) + '" title="在流线上定位"' : ' title="这个提交还没推送或不在本机记录里"') + '><div class="person-head"><span class="avatar">' + escapeHtml(m.name.slice(0, 1)) + '</span><span class="person-name">' + escapeHtml(m.name) + (m.id === team.me ? '（我）' : '') + '</span><span class="status ' + (online ? 'online' : '') + '">' + (online ? '● 在线' : '最后上报 ' + age(Date.now() - elapsed)) + '</span></div><div class="branch">' + (online ? '' : '最后使用 ') + escapeHtml(m.branch || '未检出分支') + '</div><div class="line"><span class="mono">' + short(m.head) + '</span> ' + escapeHtml(GitTimeline.isAutoCommit(m) ? '自动同步' : subjectLabel(m.subject)) + '</div><div class="line faint">' + escapeHtml(m.dirty) + ' 项未提交 · ' + (m.ahead === null ? '未关联上游' : escapeHtml(m.ahead) + ' 个提交待推送') + (online ? ' · ' + age(Date.now() - elapsed) + '上报' : '') + '</div></button>';
+        html += '<button class="person"' + (known ? ' data-locate="' + escapeHtml(m.head) + '" title="在流线上定位"' : ' title="这个提交还没推送或不在本机记录里"') + '><div class="person-head"><span class="avatar">' + escapeHtml(m.name.slice(0, 1)) + '</span><span class="person-name">' + escapeHtml(m.name) + (m.id === team.me ? '（我）' : '') + '</span><span class="status ' + (online ? 'online' : '') + '">' + (online ? '● 在线' : '最后上报 ' + age(Date.now() - elapsed)) + '</span></div><div class="branch">' + (online ? '' : '最后使用 ') + escapeHtml(m.branch || '未检出分支') + '</div><div class="line"><span class="mono">' + short(m.head) + '</span> ' + escapeHtml(GitTimeline.isAutoCommit(m) && config.showOriginal !== true ? '自动同步' : subjectLabel(m.subject)) + '</div><div class="line faint">' + escapeHtml(m.dirty) + ' 项未提交 · ' + (m.ahead === null ? '未关联上游' : escapeHtml(m.ahead) + ' 个提交待推送') + (online ? ' · ' + age(Date.now() - elapsed) + '上报' : '') + '</div></button>';
       }
       html += '<div class="team-intro small">面板打开时约每 25 秒同步一次；超过 90 秒没有上报就显示最后状态。</div>';
     }
@@ -561,7 +655,252 @@ async function syncTeam(force = false) {
 }
 
 let detailRevision = 0;
-function openDetail(title) { GitChoices.close(); showPreferences(false); activeCommitSubject = ''; $('#detail').hidden = false; $('#detail-title').textContent = title; $('#detail-body').innerHTML = '<p class="empty">正在读取…</p>'; $('#detail-body').scrollTop = 0; return ++detailRevision; }
+let workspaceView = null;
+let modelSummary = null, modelSummaryContext = '';
+function summarySignature() {
+  return JSON.stringify([state?.head, state?.status?.count, state?.status?.additions, state?.status?.deletions, (state?.status?.files || []).map(f => f.path + ':' + f.status).join('|')]);
+}
+function syncModelSummaryContext() {
+  const context = JSON.stringify([dir,state?.head,state?.branch]);
+  if (modelSummaryContext !== context) { modelSummary = null; modelSummaryContext = context; }
+}
+function renderModelSummary() {
+  const view = workspaceView;
+  if (!view || !workspaceCurrent(view)) return;
+  const host = $('#ws-model-summary'); if (!host) return;
+  const summary = modelSummary?.dir === view.dir ? modelSummary : null;
+  const loading = summary?.status === 'loading', hasPoints = !!summary?.points?.length;
+  const stale = hasPoints && summary.signature !== summarySignature();
+  let html = '';
+  if (hasPoints) {
+    const date = new Date(summary.generatedAt), when = Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString('zh-CN');
+    html += '<div class="ws-model"><h3>模型摘要</h3>' + (stale ? '<p class="ws-stale" role="status">摘要已过期 · 工作区又有新改动</p>' : '') + '<ul>' + summary.points.map(point => '<li>' + escapeHtml(point) + '</li>').join('') + '</ul><p class="ws-hint">生成于 ' + escapeHtml(when) + ' · 仅保存在本次面板内</p>' + (summary.truncated ? '<p class="ws-hint">改动较多，只总结了前一部分。</p>' : '') + '</div>';
+  }
+  if (summary?.status === 'error') html += '<p class="ws-summary-error ws-hint" role="alert">' + escapeHtml(summary.error || '摘要生成失败，请重试。') + '</p>';
+  const label = loading ? '正在生成详细摘要…' : summary?.status === 'error' ? '重试' : hasPoints ? '重新生成' : '生成详细摘要';
+  html += '<button id="ws-summarize" class="text-button"' + (loading ? ' disabled' : '') + '>' + label + '</button><p class="ws-hint">可选 · 只在点击时把这次改动的 diff 发给模型，不会提交或修改 Git。</p>';
+  // Keep the flow and all expanded file/stash diffs outside this update.
+  if (host.innerHTML !== html) host.innerHTML = html;
+}
+async function summarizeWorkspace() {
+  const view = workspaceView;
+  if (!view || !workspaceCurrent(view)) return;
+  syncModelSummaryContext();
+  if (modelSummary?.status === 'loading') return;
+  const signature = summarySignature(), previous = modelSummary;
+  const request = modelSummary = {dir:view.dir,signature:previous?.signature || signature,points:previous?.points || [],truncated:previous?.truncated || false,generatedAt:previous?.generatedAt || '',status:'loading'};
+  renderModelSummary();
+  try {
+    const result = await rpc('workspace/summarize',{dir:view.dir});
+    if (modelSummary !== request || !workspaceCurrent(view)) return;
+    if (!Array.isArray(result?.points) || !result.points.length || result.points.some(point => typeof point !== 'string' || !point.trim())) throw new Error('摘要结果格式无效，请重试。');
+    Object.assign(request,{signature,points:result.points.map(point => point.trim()),truncated:result.truncated === true,generatedAt:result.generatedAt || new Date().toISOString(),status:'ready'});
+  } catch (e) {
+    if (modelSummary === request && workspaceCurrent(view)) Object.assign(request,{status:'error',error:e?.message || '摘要生成失败，请重试。'});
+  } finally {
+    if (modelSummary === request) {
+      // Closing or reopening a detail invalidates its request. Do not leave a
+      // discarded request stuck in loading or overwrite the newer view.
+      if (request.status === 'loading') request.status = request.points.length ? 'ready' : 'idle';
+      renderModelSummary();
+    }
+  }
+}
+function openDetail(title) { workspaceView = null; GitChoices.close(); showPreferences(false); activeCommitSubject = ''; $('#detail').hidden = false; $('#detail-title').textContent = title; $('#detail-body').innerHTML = '<p class="empty">正在读取…</p>'; $('#detail-body').scrollTop = 0; return ++detailRevision; }
+function workspaceGroups(status) {
+  const files = status?.files || [], changed = code => !!code && !/[. ?]/.test(code);
+  return [
+    {scope:'conflicts', title:'冲突待处理', files:files.filter(f => f.conflict)},
+    {scope:'staged', title:'已暂存改动', files:files.filter(f => !f.conflict && !f.untracked && f.status !== '??' && (f.staged === true || changed(f.status?.[0])))},
+    {scope:'unstaged', title:'未暂存改动', files:files.filter(f => !f.conflict && !f.untracked && f.status !== '??' && (f.unstaged === true || changed(f.status?.[1])))},
+    {scope:'untracked', title:'未跟踪文件', files:files.filter(f => f.untracked || f.status === '??')}
+  ];
+}
+function stageFilesPreview(files) {
+  return files.slice(0,3).map(f => String(f.path || '').split('/').pop()).join('、') + (files.length > 3 ? ' 等 ' + files.length + ' 个文件' : '');
+}
+function stageStatsText(group) {
+  let add = 0, remove = 0;
+  for (const file of group.files) {
+    const additions = file[group.scope + 'Add'] ?? file.add;
+    const deletions = file[group.scope + 'Remove'] ?? file.remove;
+    add += Number.isFinite(additions) ? additions : 0;
+    remove += Number.isFinite(deletions) ? deletions : 0;
+  }
+  return group.files.length + (group.scope === 'untracked' ? ' 个新文件' : ' 个文件') + (add + remove > 0 ? group.scope === 'untracked' ? ' · +' + add + ' 行' : ' · +' + add + ' / -' + remove + ' 行' : '');
+}
+function updateLocalFlowCollapsed() {
+  const host = $('#local-flow'), button = $('#local-pull-handle');
+  host.classList.toggle('collapsed',localFlowCollapsed);
+  const inner = host.querySelector('.local-flow-inner');
+  if (inner) inner.inert = localFlowCollapsed;
+  if (!button) return;
+  button.setAttribute('aria-expanded',String(!localFlowCollapsed));
+  button.title = localFlowCollapsed ? '点击或向下拖动，展开本地状态' : '点击或向上拖动，收起本地状态';
+  const suffix = [state?.status?.count > 0 ? state.status.count + ' 个改动' : '', state?.stashes?.length ? '备份 ' + state.stashes.length : ''].filter(Boolean).map(s => ' · ' + s).join('');
+  button.querySelector('.pull-label').textContent = localFlowCollapsed ? '展开本地状态' + suffix : '收起本地状态';
+}
+function setLocalFlowCollapsed(collapsed) {
+  localFlowCollapsed = !!collapsed;
+  updateLocalFlowCollapsed();
+  renderTranslationStatus(); translatePending();
+}
+function stashOrigin(stash) {
+  const info = GitLabels.stashInfo(stash);
+  return (info.branch ? '来自 ' + info.branch + ' · ' : '') + age(stash.date);
+}
+function renderLocalFlow() {
+  const host = $('#local-flow'), status = state?.status, stashes = state?.stashes || [];
+  host.hidden = !state || outgoingActive || !(status?.count > 0 || stashes.length);
+  if (host.hidden) { host.innerHTML = ''; localFlowMarkup = ''; return; }
+  const summary = GitLabels.workspaceSummary(status);
+  let html = '<div class="local-flow-collapsible"><div class="local-flow-inner"><div class="local-flow-track">';
+  html += status?.count > 0 ? '<button class="local-flow-node workspace-node" data-local="changes"><span class="local-flow-head"><b>工作区改动</b><span>' + escapeHtml(summary.statsText) + '</span></span><span class="local-flow-description">' + escapeHtml(summary.headline) + '</span></button>' : '';
+  for (const group of workspaceGroups(status)) if (group.files.length) {
+    html += '<button class="local-flow-node local-stage-node stage-' + group.scope + '" data-local="' + group.scope + '"><span class="local-flow-head"><b>' + group.title + '</b><span>' + escapeHtml(stageStatsText(group)) + '</span></span><span class="local-flow-description">' + escapeHtml(stageFilesPreview(group.files)) + '</span></button>';
+  }
+  if (stashes.length) {
+    const stash = stashes[0], info = GitLabels.stashInfo(stash);
+    html += '<button class="local-flow-node stash-node" data-local="stash"><span class="local-flow-head"><b>本地备份 · ' + stashes.length + ' 份</b><span>' + escapeHtml(stashOrigin(stash)) + '</span></span><span class="local-flow-description">' + escapeHtml(config.showOriginal === true ? info.raw : info.title + (info.subtitle ? ' · ' + info.subtitle : '')) + '</span></button>';
+  }
+  html += '</div></div></div><button id="local-pull-handle" class="pull-handle local-pull-handle" data-local-toggle aria-expanded="true" title="点击或向上拖动，收起本地状态"><span class="grip"></span><span class="pull-label">收起本地状态</span>' + icon('chevron') + '</button>';
+  if (html !== localFlowMarkup) { host.innerHTML = html; localFlowMarkup = html; }
+  updateLocalFlowCollapsed();
+}
+function cleanPatchBody(patch) {
+  if (typeof patch !== 'string' || !patch.trim()) return '<p class="ws-hint">没有可显示的文本差异；文件可能是二进制文件，或已被其他操作更新。</p>';
+  let inHunk = false;
+  const lines = patch.split('\n').map(line => {
+    if (line.startsWith('diff --git ')) { inHunk = false; return ''; }
+    if (line.startsWith('\\ No newline')) return '';
+    const hunk = line.match(/^@@[^+]*\+(\d+)(?:,\d+)? @@/);
+    if (hunk) { inHunk = true; return '<span class="patch-line hunk">第 ' + hunk[1] + ' 行</span>'; }
+    if (/^(?:Binary files|GIT binary patch)/.test(line)) return '<span class="patch-line meta">二进制文件发生变化</span>';
+    // Only code lines survive; never expose binary payloads or Git metadata.
+    if (!inHunk || !/^[ +-]/.test(line)) return '';
+    return '<span class="patch-line ' + (line[0] === '+' ? 'add' : line[0] === '-' ? 'remove' : '') + '">' + (escapeHtml(line) || ' ') + '</span>';
+  }).filter(Boolean);
+  return lines.length ? '<pre class="patch ws-patch">' + lines.join('') + '</pre>' : '<p class="ws-hint">没有可显示的文本差异。</p>';
+}
+function stashFilePatch(patch, path) {
+  if (typeof patch !== 'string') return '';
+  const decodePath = value => {
+    if (!value.startsWith('"')) return value.replace(/^[ab]\//,'');
+    // Git quotes non-ASCII paths as UTF-8 octal bytes as well as C escapes.
+    try {
+      const bytes = [], encoder = new TextEncoder();
+      for (let i = 1; i < value.length - 1; i++) {
+        if (value[i] === '\\') {
+          const octal = value.slice(i + 1).match(/^[0-7]{1,3}/);
+          if (octal) { bytes.push(parseInt(octal[0],8)); i += octal[0].length; continue; }
+          const escaped = ({n:'\n',t:'\t',r:'\r',b:'\b',f:'\f',v:'\v'})[value[++i]] ?? value[i];
+          bytes.push(...encoder.encode(escaped));
+        } else bytes.push(...encoder.encode(value[i]));
+      }
+      return new TextDecoder().decode(new Uint8Array(bytes)).replace(/^[ab]\//,'');
+    } catch { return ''; }
+  };
+  return patch.split(/(?=^diff --git )/m).filter(block => {
+    const markers = [...block.matchAll(/^(?:---|\+\+\+) (.+)$/gm)].map(m => decodePath(m[1]));
+    if (markers.includes(path)) return true;
+    const header = block.split('\n',1)[0];
+    return header.endsWith(' b/' + path) || header.endsWith(' ' + JSON.stringify('b/' + path));
+  }).join('');
+}
+function workspaceStatus(data, fallback = {}) {
+  const result = data?.status || data || {};
+  return { ...fallback, ...result, files:Array.isArray(result.files) ? result.files : fallback.files || [], count:result.count ?? (Array.isArray(result.files) ? result.files.length : fallback.count || 0) };
+}
+function workspaceSummaryCard(status) {
+  const summary = GitLabels.workspaceSummary(status), files = status.files || [];
+  const available = key => files.some(f => Number.isFinite(f[key]));
+  const add = Number.isFinite(status.additions) ? status.additions : available('add') ? files.reduce((n,f) => n + (f.add || 0),0) : null;
+  const remove = Number.isFinite(status.deletions) ? status.deletions : available('remove') ? files.reduce((n,f) => n + (f.remove || 0),0) : null;
+  const total = (add || 0) + (remove || 0), fraction = total ? ((add || 0) / total * 100).toFixed(2) : 50;
+  return '<section class="ws-summary"><div class="ws-eyebrow">本地工作区</div><h2>' + escapeHtml(summary.headline) + '</h2><div class="ws-stats"><b>' + status.count + ' 个文件</b>' + (add !== null ? '<span class="ws-add">+' + add + ' 新增行</span>' : '') + (remove !== null ? '<span class="ws-remove">−' + remove + ' 删除行</span>' : '') + '</div>' + (total ? '<div class="ws-ratio" aria-hidden="true"><i style="width:' + fraction + '%"></i></div>' : '') + '<ul>' + summary.bullets.map(b => '<li>' + escapeHtml(b) + '</li>').join('') + '</ul><div id="ws-model-summary" class="ws-model-summary" aria-live="polite"></div><p class="ws-hint">基于当前未提交改动整理 · 未写入 Git 提交记录</p></section>';
+}
+function workspaceFileRows(files, scope, view, stash) {
+  return '<div class="ws-files">' + files.map(f => {
+    const id = view.files.length; view.files.push({file:f,scope,stash});
+    const path = String(f.path || ''), slash = path.lastIndexOf('/'), name = path.slice(slash + 1), folder = slash >= 0 ? path.slice(0,slash) : '';
+    const add = scope === 'staged' ? f.stagedAdd ?? f.add : scope === 'unstaged' ? f.unstagedAdd ?? f.add : scope === 'untracked' ? f.untrackedAdd ?? f.add : f.add;
+    const remove = scope === 'staged' ? f.stagedRemove ?? f.remove : scope === 'unstaged' ? f.unstagedRemove ?? f.remove : f.remove;
+    const lines = Number.isFinite(add) || Number.isFinite(remove) ? '<span class="ws-file-lines"><span class="ws-add">+' + (add || 0) + '</span> <span class="ws-remove">−' + (remove || 0) + '</span></span>' : '';
+    return '<div class="ws-file"><button class="ws-file-toggle" data-ws-file="' + id + '" aria-expanded="false" aria-controls="ws-diff-' + id + '"' + (!view.ready ? ' disabled' : '') + '><span class="ws-file-name"><b>' + escapeHtml(name) + '</b>' + (folder ? '<small>' + escapeHtml(folder) + '</small>' : '') + '</span><span class="ws-file-side"><span class="ws-file-badge">' + GitLabels.stageFileBadge(f,scope) + '</span>' + lines + '</span></button><div id="ws-diff-' + id + '" class="ws-inline-diff" hidden></div></div>';
+  }).join('') + '</div>';
+}
+function renderWorkspace(view) {
+  if (!workspaceCurrent(view)) return;
+  view.files = [];
+  const current = [...(state.currentCommits || []), ...(state.commits || [])].find(c => c.sha === view.head);
+  let html = view.status.count || modelSummary?.points?.length ? workspaceSummaryCard(view.status) : '<p class="ws-hint ws-clean">工作区没有未提交改动。</p>';
+  if (!view.ready) html += '<p class="ws-hint" role="status">正在整理文件统计…</p>';
+  if (view.warning) html += '<p class="ws-hint">' + escapeHtml(view.warning) + '</p>';
+  html += '<div class="ws-flow"><section class="ws-node ws-base"><h3>当前基准提交</h3><div class="ws-base-meta"><span class="chip here">' + escapeHtml(view.branch || '当前提交') + '</span><span class="mono">' + short(view.head) + '</span></div><p>' + escapeHtml(current ? current.auto || GitTimeline.isAutoCommit(current) ? autoTitle(current) : subjectLabel(current.subject) : view.head ? '当前分支已保存的版本' : '尚未创建首次提交') + '</p></section>';
+  for (const group of workspaceGroups(view.status)) if (group.files.length) html += '<section id="ws-stage-' + group.scope + '" class="ws-node' + (group.scope === 'conflicts' ? ' ws-conflict' : '') + '" tabindex="-1"><h3>' + group.title + ' <span>· ' + group.files.length + ' 个文件</span></h3>' + workspaceFileRows(group.files,group.scope,view) + '</section>';
+  if (view.status.truncated) html += '<p class="ws-hint">当前仅显示部分文件，统计以已读取的内容为准。</p>';
+  if (view.stashes.length) html += '<section id="ws-stashes" class="ws-node ws-stashes" tabindex="-1"><h3>本地备份 <span>· ' + view.stashes.length + ' 份</span></h3>' + view.stashes.map((s,index) => {
+    const info = GitLabels.stashInfo(s);
+    return '<div class="ws-stash"><button class="ws-stash-toggle" data-ws-stash="' + index + '" aria-expanded="false" aria-controls="ws-stash-body-' + index + '"><b data-stash-title="' + index + '">' + escapeHtml(config.showOriginal === true ? info.raw : info.title) + '</b><span>' + escapeHtml(stashOrigin(s)) + '</span><small data-stash-subtitle="' + index + '"' + (config.showOriginal === true || !info.subtitle ? ' hidden' : '') + '>' + escapeHtml(info.subtitle) + '</small></button><div id="ws-stash-body-' + index + '" class="ws-stash-body" hidden></div></div>';
+  }).join('') + '</section>';
+  $('#detail-body').innerHTML = '<article class="workspace-detail">' + html + '</div><p class="ws-hint">仅查看本地状态，不会暂存、恢复或删除备份。</p></article>';
+  renderModelSummary();
+}
+function workspaceCurrent(view) { return workspaceView === view && view.rev === detailRevision && view.generation === generation && view.dir === dir && view.head === state?.head && view.branch === state?.branch && !$('#detail').hidden; }
+async function showWorkspace(focusSection = 'changes') {
+  if (!state) return;
+  syncModelSummaryContext();
+  const rev = openDetail('本地工作区与备份流线');
+  const view = workspaceView = {rev,generation,dir,head:state.head,branch:state.branch,status:state.status || {count:0,files:[]},stashes:state.stashes || [],files:[],ready:true,loaded:new Map(),pending:new Set(),stashPatches:new Map()};
+  renderWorkspace(view);
+  renderTranslationStatus(); translatePending();
+  if (['conflicts','staged','unstaged','untracked'].includes(focusSection)) {
+    const section = $('#ws-stage-' + focusSection);
+    section?.scrollIntoView({block:'start',behavior:config.motion === false ? 'auto' : 'smooth'});
+    section?.focus({preventScroll:true});
+  }
+  if (focusSection === 'stash' && view.stashes.length) {
+    $('#ws-stashes')?.scrollIntoView({block:'start',behavior:config.motion === false ? 'auto' : 'smooth'});
+    $('#ws-stashes')?.focus({preventScroll:true});
+    await toggleWorkspaceStash(0);
+  }
+}
+async function toggleWorkspaceFile(id) {
+  const view = workspaceView, entry = view?.files[id]; if (!entry || !view.ready || !workspaceCurrent(view)) return;
+  const body = $('#ws-diff-' + id), button = $('#detail-body').querySelector('[data-ws-file="' + id + '"]'); if (!body || !button) return;
+  body.hidden = !body.hidden; button.setAttribute('aria-expanded',String(!body.hidden));
+  const key = 'file:' + id; if (body.hidden || view.loaded.has(key) || view.pending.has(key)) return;
+  view.pending.add(key); body.innerHTML = '<p class="ws-hint" role="status">正在读取文件差异…</p>';
+  try {
+    // Stash patches were fetched from that immutable stash, never from the
+    // current working tree. Render just this file when the user opens it.
+    const data = entry.stash ? {patch:stashFilePatch(view.stashPatches.get(entry.stash),entry.file.path)} : await rpc('repo/workspace',{dir:view.dir,path:entry.file.path,scope:entry.scope === 'conflicts' ? 'all' : entry.scope});
+    if (!workspaceCurrent(view)) return;
+    const html = cleanPatchBody(data?.patch ?? data?.diff) + (data?.truncated ? '<p class="ws-hint">差异较长，仅显示部分内容。</p>' : '');
+    body.innerHTML = html; view.loaded.set(key,html);
+  } catch { if (workspaceCurrent(view)) body.innerHTML = '<p class="ws-hint">暂时无法读取这个文件的差异。收起后重新点开即可重试。</p>'; }
+  finally { view.pending.delete(key); }
+}
+async function toggleWorkspaceStash(index) {
+  const view = workspaceView, stash = view?.stashes[index]; if (!stash || !workspaceCurrent(view)) return;
+  const body = $('#ws-stash-body-' + index), button = $('#detail-body').querySelector('[data-ws-stash="' + index + '"]'); if (!body || !button) return;
+  body.hidden = !body.hidden; button.setAttribute('aria-expanded',String(!body.hidden));
+  const key = 'stash:' + index; if (body.hidden || view.loaded.has(key) || view.pending.has(key)) return;
+  view.pending.add(key); body.innerHTML = '<p class="ws-hint" role="status">正在读取备份内容…</p>';
+  try {
+    const data = await rpc('repo/workspace',{dir:view.dir,stash:stash.sha}); if (!workspaceCurrent(view)) return;
+    const status = workspaceStatus(data), rawPatch = data?.patch ?? data?.diff ?? '';
+    status.files = status.files.map(f => {
+      if (f.status || f.untracked) return f;
+      const header = stashFilePatch(rawPatch,f.path).split(/^@@/m,1)[0];
+      return {...f,status:/^new file mode /m.test(header) ? 'A' : /^deleted file mode /m.test(header) ? 'D' : /^rename from /m.test(header) ? 'R' : 'M'};
+    });
+    view.stashPatches.set(stash.sha,rawPatch);
+    const html = '<p class="ws-stash-stats">' + escapeHtml(GitLabels.workspaceSummary(status).statsText) + '</p>' + workspaceFileRows(status.files,'stash',view,stash.sha) + (!status.files.length ? cleanPatchBody(data?.patch ?? data?.diff) : '') + (data?.truncated ? '<p class="ws-hint">备份差异较长，仅显示部分内容。</p>' : '');
+    body.innerHTML = html; view.loaded.set(key,html);
+  } catch { if (workspaceCurrent(view)) body.innerHTML = '<p class="ws-hint">暂时无法读取备份；备份仍保留在本机，收起后点开可重试。</p>'; }
+  finally { view.pending.delete(key); }
+}
 function patchHead(text, row) {
   const lines = text.split('\n'); let i = 0, author = '';
   for (; i < lines.length && lines[i]; i++) if (lines[i].startsWith('Author:')) author = lines[i].replace(/^Author:\s*/, '').replace(/\s*<[^>]*>$/, '');
@@ -621,7 +960,7 @@ async function showCompare(target) {
     $('#detail-body').innerHTML = '<div class="comparison"><h3>' + relation + '</h3><div class="nums"><div class="num"><b>' + d.ahead + '</b>当前分支独有</div><div class="num"><b>' + d.behind + '</b>' + escapeHtml(label) + ' 独有</div></div><p>' + (d.dirty ? '工作区还有 ' + d.dirty + ' 项未提交改动，切换或合并前要先处理。' : '工作区没有未提交改动。') + '</p><p class="small">' + escapeHtml(d.note) + '</p></div>' + (d.diff ? patchBody(d.diff) : '<p class="empty">两边的文件内容一致。</p>');
   } catch (e) { if (rev === detailRevision) $('#detail-body').innerHTML = '<p class="empty">' + escapeHtml(e.message) + '</p>'; }
 }
-function closeDetail() { ++detailRevision; activeCommitSubject = ''; $('#detail').hidden = true; }
+function closeDetail() { ++detailRevision; workspaceView = null; activeCommitSubject = ''; $('#detail').hidden = true; renderTranslationStatus(); translatePending(); }
 function showReadingGuide() {
   openDetail('怎么看提交图');
   const colors = ['绿色', '紫色', '黄色', '蓝色', '粉色', '草绿色', '橙色', '青色'];
@@ -662,6 +1001,7 @@ function switchTab(next) {
   if (tab === 'timeline' && state && (!graphKey || (geometry && geometry.height !== $('#graph').scrollHeight))) renderGraph();
   if (tab === 'branches') renderBranches();
   if (tab === 'team') { renderTeam(); syncTeam(); }
+  renderTranslationStatus(); translatePending();
 }
 
 async function resumeFollowing() {
@@ -715,7 +1055,9 @@ $('#preferences-toggle').onclick = () => showPreferences($('#preferences').hidde
 $('#close-preferences').onclick = () => showPreferences(false, true);
 $('#search-toggle').onclick = () => toggleSearch($('#searchbar').hidden);
 $('#close-search').onclick = () => toggleSearch(false);
+$('#load-more').onclick = loadMoreHistory;
 $('#current-branch').onclick = () => { if (state?.head) locate(state.head); };
+$('#ahead').onclick = toggleOutgoing;
 document.addEventListener('choice-opening', event => { if (!$('#preferences').contains(event.target)) showPreferences(false); });
 let handleGesture = null, ignoreHandleClick = false;
 $('#pull-handle').onpointerdown = event => {
@@ -751,6 +1093,12 @@ $('#auto-fetch').onchange = async event => {
 $('#search').oninput = filterGraph;
 $('#timeline-scope').onchange = () => setTimelineScope($('#timeline-scope').value);
 $('#motion').onclick = async () => { try { config = await rpc('config/update', { motion: config.motion === false }); options(); } catch (e) { error(e.message); } };
+$('#show-original').onclick = async () => {
+  const button = $('#show-original'); button.disabled = true;
+  try { config = await rpc('config/update', { showOriginal: config.showOriginal !== true }); translationStalled.clear(); options(); repaintTranslations(); translatePending(); }
+  catch (e) { options(); error(e.message); }
+  finally { button.disabled = false; }
+};
 $('#auto-sync').onclick = async () => {
   const button = $('#auto-sync'); button.disabled = true;
   try { config = await rpc('config/update', { foldAuto: config.foldAuto === false }); options(); graphKey = ''; if (state) render(); }
@@ -760,9 +1108,33 @@ $('#auto-sync').onclick = async () => {
 $('#close-detail').onclick = closeDetail;
 $('#reading-guide').onclick = showReadingGuide;
 $('#retry-translation').onclick = () => translatePending(true);
-$('#dirty').onclick = () => {
-  openDetail('工作区改动 · ' + state.status.count + ' 项');
-  $('#detail-body').innerHTML = state.status.files.map(f => '<div class="file-item"><span class="file-status">' + escapeHtml(GitLabels.fileStatus(f)) + '</span><span>' + escapeHtml(f.path) + (f.from ? ' ← ' + escapeHtml(f.from) : '') + (f.conflict ? ' · 冲突待处理' : '') + '</span></div>').join('') + (state.status.truncated ? '<p class="empty">只显示前 300 项。</p>' : '') || '<p class="empty">工作区干净。</p>';
+$('#dirty').onclick = () => showWorkspace('changes');
+$('#stash-pill').onclick = () => showWorkspace('stash');
+let localHandleGesture = null, ignoreLocalHandleClick = false;
+$('#local-flow').onpointerdown = event => {
+  const handle = event.target.closest('[data-local-toggle]');
+  if (!handle || event.button !== 0) return;
+  localHandleGesture = {id:event.pointerId,y:event.clientY};
+  handle.setPointerCapture(event.pointerId);
+};
+$('#local-flow').onpointerup = event => {
+  if (!localHandleGesture || event.pointerId !== localHandleGesture.id) return;
+  const distance = event.clientY - localHandleGesture.y; localHandleGesture = null;
+  if (Math.abs(distance) > 20) {
+    ignoreLocalHandleClick = true; setTimeout(() => { ignoreLocalHandleClick = false; },0);
+    setLocalFlowCollapsed(distance < 0);
+  }
+};
+$('#local-flow').onpointercancel = () => { localHandleGesture = null; };
+$('#local-flow').onclick = event => {
+  const toggle = event.target.closest('[data-local-toggle]');
+  if (toggle?.dataset.localToggle !== undefined) { if (!ignoreLocalHandleClick) setLocalFlowCollapsed(!localFlowCollapsed); return; }
+  const node = event.target.closest('[data-local]'); if (node) return showWorkspace(node.dataset.local);
+};
+$('#detail-body').onclick = event => {
+  if (event.target.closest('#ws-summarize')) return summarizeWorkspace();
+  const file = event.target.closest('[data-ws-file]'); if (file) return toggleWorkspaceFile(Number(file.dataset.wsFile));
+  const stash = event.target.closest('[data-ws-stash]'); if (stash) return toggleWorkspaceStash(Number(stash.dataset.wsStash));
 };
 $('.tabs').onclick = event => { const button = event.target.closest('[data-tab]'); if (button) switchTab(button.dataset.tab); };
 $('#graph').onclick = event => {
@@ -788,6 +1160,7 @@ $('#sheet').onclick = event => {
   if (action === 'compare') showCompare(selected);
 };
 $('#branches').onclick = event => {
+  if (event.target.closest('[data-outgoing]')) return toggleOutgoing();
   const compare = event.target.closest('[data-compare]'); if (compare) return showCompare(compare.dataset.compare);
   const target = event.target.closest('[data-locate]'); if (target) locate(target.dataset.locate);
 };
@@ -833,12 +1206,17 @@ GitBridge.on(async message => {
     try { const latest = await rpc('config/read'); config.headerCollapsed = latest.headerCollapsed; if (!collapseSaving) applyControls(config.headerCollapsed === true && !!state); } catch (e) { error(e.message); }
   }
   if (message.type === 'config-changed') {
-    ++teamGeneration; team = null; teamError = ''; nextTeamAt = 0; teamFailures = 0;
     try {
-      const wasFold = config.foldAuto;
-      config = await rpc('config/read'); if (configReady) await syncRepositoryLock(config); options(); if (state && tab === 'team') renderTeam();
+      const wasFold = config.foldAuto, wasOriginal = config.showOriginal;
+      const latest = await rpc('config/read');
+      // 显示偏好变化只重画文字，不清空已经显示的队友状态。
+      if (config.teamUrl !== latest.teamUrl || config.displayName !== latest.displayName || JSON.stringify(config.teamRepos) !== JSON.stringify(latest.teamRepos)) {
+        ++teamGeneration; team = null; teamError = ''; nextTeamAt = 0; teamFailures = 0;
+      }
+      config = latest; if (configReady) await syncRepositoryLock(config); options(); if (state && tab === 'team') renderTeam();
       // 其他面板改了折叠开关时，这里也要跟着重画流线。
       if (state && config.foldAuto !== wasFold) { graphKey = ''; render(); }
+      if (config.showOriginal !== wasOriginal) { translationStalled.clear(); repaintTranslations(); translatePending(); }
     } catch (e) { error(e.message); }
   }
   if (message.type === 'repo-connected' && message.dir !== dir && (!activeFocus || !message.sessionId || message.sessionId === activeFocus.sessionId)) connect(message.dir);

@@ -29,8 +29,9 @@
     </header>
     <div id="overview" class="overview" hidden>
       <button id="current-branch" class="current-branch" title="在流线上定位当前分支"></button>
-      <div class="pills"><button id="dirty" class="pill" title="查看未提交文件"></button><span id="ahead" class="pill"></span><span id="behind" class="pill"></span></div>
+      <div class="pills"><button id="dirty" class="pill" title="查看未提交文件"></button><button id="ahead" class="pill" aria-pressed="false" title="定位待推送提交"></button><span id="behind" class="pill"></span></div>
     </div>
+    <div id="tracking-row" class="tracking-row" hidden><span id="branch-tracking" class="branch-tracking"></span><button id="stash-pill" class="pill stash-pill" hidden title="查看本地备份" aria-label="查看本地备份"></button></div>
     <div id="viewbar" class="viewbar" hidden>
       <nav class="tabs" aria-label="仓库视图"><button data-tab="timeline" class="active" aria-selected="true" title="查看提交与分支关系">流线</button><button data-tab="branches" aria-selected="false" title="查看、定位或比较分支">分支<span id="branch-count" class="count"></span></button><button data-tab="team" aria-selected="false" title="查看本机工作区与队友状态">协作<span id="team-count" class="count"></span></button></nav>
       <button id="timeline-scope" class="choice-trigger scope-choice" aria-label="流线显示范围" aria-haspopup="listbox" aria-expanded="false" title="选择显示全仓库或当前分支的提交">全仓库</button>
@@ -51,7 +52,7 @@
   <section id="workspace" hidden>
       <div id="translation-row" class="translation-row" hidden><span id="translation-status" role="status"></span><button id="retry-translation" class="text-button" hidden>重试中文翻译</button></div>
     <div id="timeline" class="view">
-      <div id="graph-scroll" class="scroll"><div id="graph"></div><div id="graph-foot" class="foot"></div></div>
+      <div id="graph-scroll" class="scroll"><div id="local-flow" class="local-flow" hidden></div><div id="graph"></div><div id="graph-foot" class="foot"></div><button id="load-more" class="text-button" hidden>加载更早的提交</button></div>
       <div id="sheet" class="sheet" hidden></div>
     </div>
     <div id="branches" class="view scroll" hidden></div>
@@ -67,10 +68,12 @@
     <p class="preference-note">获取远端分支和提交记录，不会自动合并代码。</p>
     <div class="preference-section"><p id="tracking" class="preference-note"></p><p id="sampled" class="preference-note"></p></div>
     <div class="preference-row preference-section"><span>路径流光</span><button id="motion" class="switch" aria-label="路径流光" aria-pressed="true"><span></span></button></div>
+    <div class="preference-row"><span>显示提交原文</span><button id="show-original" class="switch" aria-label="显示提交原文" aria-describedby="show-original-help" aria-pressed="false"><span></span></button></div>
+    <p id="show-original-help" class="preference-note">默认自动翻译为中文；开启后显示 Git 原始标题并暂停新翻译。折叠组仍显示汇总，关闭下方折叠可逐条看原文。</p>
     <div class="preference-row"><span>折叠自动同步</span><button id="auto-sync" class="switch" aria-label="折叠 Maker 自动同步提交" aria-describedby="auto-sync-help" aria-pressed="true"><span></span></button></div>
     <p id="auto-sync-help" class="preference-note">开启后，连续快照合成「自动同步 ×N」；单条显示为「自动同步」。点开可看改动，不会删除 Git 记录。</p>
     <button id="reading-guide" class="text-button guide-link">读图说明与操作帮助</button>
-    <p class="preference-note">Git 流线 1.9.0</p>
+    <p class="preference-note">Git 流线 1.9.1</p>
   </section>
   <section id="repo-dialog" class="overlay" role="dialog" aria-labelledby="repo-dialog-title" hidden>
     <div class="overlay-head"><button id="close-repo-dialog" class="icon-button" title="返回" aria-label="返回"><svg><use href="#i-back"/></svg></button><b id="repo-dialog-title">切换仓库</b><span id="repo-dialog-count" class="overlay-sub"></span></div>
