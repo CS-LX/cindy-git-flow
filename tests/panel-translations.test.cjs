@@ -79,6 +79,14 @@ test('Git merge templates do not produce translation requests on timeline or bra
  assert.equal(h.subjects.length,0);assert.equal(h.batches.length,0);assert.equal(p.run('untranslatedSubjects().length'),0);
 });
 
+test('Maker wake commits do not produce translation requests on timeline or branch pages',async()=>{
+ const h=host(),p=panel(h);
+ p.context.wakeTitles=['chore: wake maker build server','chore(build): wake maker build server','🚀 chore( build ): wake maker build server'];
+ p.run('state.commits=wakeTitles.map((subject,i)=>({sha:"wake"+i,subject,parents:[]}));state.refs=state.commits.map(c=>({...c,remote:false}));');
+ await p.run('translatePending()');p.run("switchTab('branches')");await p.run('translatePending()');
+ assert.equal(h.subjects.length,0);assert.equal(h.batches.length,0);assert.equal(p.run('untranslatedSubjects().length'),0);
+});
+
 test('620 visible branch titles drain once; refresh/tab changes preserve all session results', async t => {
   const h = host(), p = panel(h); p.context.refs = refs;
   p.run('state.refs=refs; state.commits=refs.slice(0,180);');

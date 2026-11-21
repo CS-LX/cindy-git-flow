@@ -4,16 +4,19 @@
   // 标题模板固定、作者是 Maker 或 TapCode Rollback，所以两者一起判断。
   // 兼容斜杠/短横线及未补零的月、日、小时；不能把文档里的日期格式当真实数据。
   const SYNC_SUBJECT = /^\[\d{9,16}\]\s*sync(?:\s+at)?\s+\d{4}([/-])\d{1,2}\1\d{1,2}[ T]\d{1,2}:\d{2}/i;
+  // Maker 无本地改动触发远程构建时写入的空提交。可容纳日志前的 emoji/标点前缀。
+  const WAKE_SUBJECT = /^(?:[^\p{L}\p{N}\s]+\s*)*chore(?:\(\s*build\s*\))?:\s*wake\s+maker\s+build\s+server$/iu;
   const GROUP_PREFIX = 'auto:';
   function isAutoSubject(subject) {
-    return SYNC_SUBJECT.test(String(subject ?? '').trim());
+    const value = String(subject ?? '').trim();
+    return SYNC_SUBJECT.test(value) || WAKE_SUBJECT.test(value);
   }
   function isAutoCommit(commit) {
     if (!commit || !isAutoSubject(commit.subject)) return false;
     const author = String(commit.author ?? '').trim(), email = String(commit.email ?? '').trim();
     // 只有标题可用时按格式判断，拿到作者信息后再收紧一次。
     if (!author && !email) return true;
-    return /^(?:maker|tapcode rollback)$/i.test(author) || /@taptap\.(?:cn|com)$/i.test(email);
+    return /^(?:maker|tapcode rollback|taptap-maker)$/i.test(author) || /^(?:maker-mcp@local|.*@taptap\.(?:cn|com))$/i.test(email);
   }
   const parentsOf = commit => Array.isArray(commit.parents) ? commit.parents : [];
   // 连续的自动同步提交收成一行；其余提交原样保留。

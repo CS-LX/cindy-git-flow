@@ -59,6 +59,33 @@ test('真实项目的斜杠日期、未补零时间和不带邮箱的快照都�
   assert.deepEqual(model.items[0].parents, ['real']);
 });
 
+test('Maker 构建唤醒提交按机器身份识别并与同步快照连续折叠', () => {
+  const wake = (sha, parent, subject = 'chore: wake maker build server', author = 'taptap-maker', email = 'maker-mcp@local') => ({ sha, parents: parent ? [parent] : [], author, email, date: '2026-11-20T09:06:14.000Z', subject });
+  for (const subject of ['chore: wake maker build server', 'chore(build): wake maker build server', '🚀 chore( build ): wake maker build server']) {
+    assert.equal(timeline.isAutoSubject(subject), true, subject);
+    assert.equal(timeline.isAutoCommit({ subject, author: 'taptap-maker' }), true, subject);
+    assert.equal(timeline.isAutoCommit({ subject, email: 'maker-mcp@local' }), true, subject);
+    assert.equal(timeline.isAutoCommit({ subject, author: 'Maker' }), true, subject);
+    assert.equal(timeline.isAutoCommit({ subject, author: 'TapCode Rollback' }), true, subject);
+    assert.equal(timeline.isAutoCommit({ subject, author: 'xd', email: 'xd@example.com' }), false, subject);
+  }
+  assert.equal(timeline.isAutoCommit({ subject: 'feat: add weapon', author: 'taptap-maker' }), false);
+  assert.equal(timeline.isAutoCommit({ subject: 'chore(build): bundle assets', email: 'maker-mcp@local' }), false);
+  const model = timeline.build([
+    wake('w3', 'w2'),
+    wake('w2', 'w1', 'chore(build): wake maker build server'),
+    sync('w1', 'human'),
+    human('human', 'base', 'fix: 保留人工提交'),
+    human('base', null, 'init')
+  ]);
+  assert.deepEqual(model.items.map(i => i.sha), ['auto:w3', 'human', 'base']);
+  assert.equal(model.items[0].auto.count, 3);
+  assert.equal(model.items[0].auto.folded, true);
+  const raw = timeline.build([wake('single', 'base')], { fold: false });
+  assert.equal(raw.items[0].auto.folded, false);
+  assert.equal(raw.items[0].auto.count, 1);
+});
+
 test('连续的构建快照折成一行，父母提交接到下面真实的提交上', () => {
   const commits = [sync('s3', 's2'), sync('s2', 's1', '2026-11-04 17:05:00'), sync('s1', 'human', '2026-11-04 17:04:00'), human('human', 'base', 'feat(audio): add harvest sound'), human('base', null, 'init')];
   const model = timeline.build(commits);

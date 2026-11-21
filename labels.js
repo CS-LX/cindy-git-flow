@@ -2,6 +2,14 @@
   'use strict';
   const types = { feat: '新增功能', fix: '修复问题', style: '样式调整', merge: '合并更新', docs: '文档更新', chore: '维护整理', perf: '性能优化', refactor: '代码整理', test: '测试更新', art: '美术更新', tune: '参数调整', tweak: '细节调整', revert: '撤销提交', build: '构建更新', ci: '自动化更新' };
   const areas = { story: '剧情', input: '输入控制', camera: '镜头', ui: '界面', salvage: '搜打撤', combat: '战斗', battle: '战斗', tutorial: '新手引导', drive: '驾驶', plugins: '插件', vehicle: '载具', nono: '诺诺', audio: '音频', vanguard: '先锋', drills: '钻头', pvp: '对战', mech: '机甲', mechleg: '机甲腿', intro: '开场', navigator: '领航员', brand: '品牌', endless: '无尽模式', 'endless P0': '无尽模式第零阶段', 'battle-tab': '战斗页', 'match-intro': '对局开场' };
+  // 与 timeline.js 的 SYNC_SUBJECT / WAKE_SUBJECT 保持一致：两个脚本可单独加载，
+  // 因此各自持有同一份正则，避免依赖加载顺序。
+  const SYNC_SUBJECT = /^\[\d{9,16}\]\s*sync(?:\s+at)?\s+\d{4}([/-])\d{1,2}\1\d{1,2}[ T]\d{1,2}:\d{2}/i;
+  const WAKE_SUBJECT = /^(?:[^\p{L}\p{N}\s]+\s*)*chore(?:\(\s*build\s*\))?:\s*wake\s+maker\s+build\s+server$/iu;
+  const isAutoSyncSubject = value => {
+    const text = String(value ?? '').trim();
+    return SYNC_SUBJECT.test(text) || WAKE_SUBJECT.test(text);
+  };
   // 已核对的中文释义仅用于显示，提交记录、分支名和作者名始终保留原值。
   const descriptions = {
     'add initial MVP cinematic and quick preview': '添加首版原型过场动画和快速预览',
@@ -112,7 +120,7 @@
   }
   function needsTranslation(value) {
     const original = String(value || '');
-    if (translations.has(original) || Object.hasOwn(plain, original) || mergeSubject(original)) return false;
+    if (translations.has(original) || Object.hasOwn(plain, original) || mergeSubject(original) || isAutoSyncSubject(original)) return false;
     const m = original.match(/^([a-z]+)(?:\(([^)]+)\))?(!)?:\s*(.*)$/s);
     if (m && Object.hasOwn(types, m[1])) {
       if (m[2] && !Object.hasOwn(areas, m[2]) && /[a-z]/i.test(m[2])) return true;
@@ -159,10 +167,10 @@
     const base = body.match(/^([0-9a-f]{6,40})\s+(.*)$/i);
     if (/^(?:WIP on|index on)$/i.test(match?.[1] || '') || base) {
       const baseSubject = base ? base[2] : body;
-      const autoBase = /\[\d{9,16}\]\s*sync/i.test(baseSubject);
+      const autoBase = isAutoSyncSubject(baseSubject);
       return { title: '临时备份', subtitle: !baseSubject ? '' : autoBase ? '基于自动同步快照' : '基于：' + translated(baseSubject), branch, auto: false, raw, source: autoBase ? '' : sourceFor(baseSubject) };
     }
-    if (/^\[\d{9,16}\]\s*sync\b/i.test(body)) return { title: '自动同步快照', subtitle: '', branch, auto: false, raw, source: '' };
+    if (isAutoSyncSubject(body)) return { title: '自动同步快照', subtitle: '', branch, auto: false, raw, source: '' };
     return { title: body ? translated(body) : '本地备份', subtitle: '', branch, auto: false, raw, source: sourceFor(body) };
   }
   function stageFileBadge(file, stage) {

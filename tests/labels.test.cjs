@@ -1,7 +1,15 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { subject, fileStatus } = require('../labels.js');
+const { subject, fileStatus, needsTranslation, stashInfo } = require('../labels.js');
+
+test('Maker 构建唤醒标题不进翻译队列，备份基准也显示自动同步快照', () => {
+ for (const title of ['chore: wake maker build server','chore(build): wake maker build server','🚀 chore( build ): wake maker build server']) {
+  assert.equal(needsTranslation(title), false, title);
+  assert.equal(stashInfo({subject:'WIP on main: '+title}).subtitle, '基于自动同步快照', title);
+  assert.equal(stashInfo({subject:'On main: '+title}).title, '自动同步快照', title);
+ }
+});
 test('本地合并模板优先于旧模型译文，仅清理目的地标识符的引号',()=>{
  const fs=require('node:fs'),vm=require('node:vm'),context={};vm.runInNewContext(fs.readFileSync(require.resolve('../labels.js'),'utf8'),context);const L=context.GitLabels,merge="Merge pull request #5380 into 'develop'";
  L.loadTranslations({[merge]:"合并拉取请求 #5380 到 'develop'",'quote preserve sample':"修复 'module' 的问题",'destination quote sample':"合入更新到 'develop'",'destination double sample':'切换到 "release/v2"','prose quote sample':"移动到 'new branch'",'middle quote sample':"修复 'x' 的问题"});
