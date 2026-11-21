@@ -1,5 +1,10 @@
 # 验证记录
 
+## Maker 构建唤醒提交自动折叠（2026-11-22）
+
+- `chore: wake maker build server` 与 `chore(build): wake maker build server`（含前导 emoji）在作者 `taptap-maker`、`Maker`、`TapCode Rollback` 或邮箱 `maker-mcp@local` / `@taptap.cn` / `@taptap.com` 时按自动同步识别并折叠；同名人工提交和普通代码改动保持普通提交。
+- 唤醒提交与旧 `[时间戳] sync at ...` 可连续归并，分支、合并边界和关闭折叠均保留原有行为；标题不进入中文翻译队列。
+
 ## 1.9.1 提交原文开关与 TapCode 快照识别（2026-11-06）
 
 - 默认继续显示自动中文翻译；「远端与显示 → 显示提交原文」同时作用于流线、分支、协作和已打开的提交详情，持久保存。原文模式停止发起新翻译，在途结果只进入缓存，不覆盖原文。折叠与语言模式互相独立。
