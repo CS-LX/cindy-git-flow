@@ -254,7 +254,34 @@ function parseSummaryPoints(raw) {
   }
   return null;
 }
+const warningId = 'repository-warning';
+let composerWarning = null, warningTimer;
+let warningConsumers = [];
+function publishWarning(sessionId) {
+  if (!sessionId) return;
+  const warning = composerWarning?.sessionId === sessionId ? composerWarning : null;
+  return Promise.all(warningConsumers.filter(c => c.sessionId === sessionId).map(({clientId}) =>
+    cindy.ui?.updateContribution(warningId,
+      () => warning ? { title: warning.text, visible: true } : { visible: false }, { sessionId, clientId })));
+}
+function syncWarningConsumers(consumers) {
+  warningConsumers = consumers.filter(c => c.id === warningId);
+  return Promise.all([...new Set(warningConsumers.map(c => c.sessionId))].map(publishWarning));
+}
 async function action(method, params = {}, callId) {
+  if (method === 'ui/repository-warning') {
+    if (!sessionFocus || params.revision !== sessionFocus.revision || params.sessionId !== sessionFocus.sessionId) return;
+    const text = typeof params.text === 'string' ? params.text.trim().slice(0, 100) : '';
+    if (!text) return;
+    const sessionId = sessionFocus.sessionId;
+    clearTimeout(warningTimer);
+    const previous = composerWarning;
+    composerWarning = { sessionId, text };
+    if (previous && previous.sessionId !== sessionId) void publishWarning(previous.sessionId);
+    warningTimer = setTimeout(() => { composerWarning = null; void publishWarning(sessionId); }, 6200);
+    await publishWarning(sessionId);
+    return true;
+  }
   if (method === 'workspace/summarize') {
     const diff = await node('repo/workspace-diff', { dir: params.dir, limit: 26000 }, callId);
     if (!diff.text.trim()) throw new Error('工作区没有可总结的改动。');
@@ -303,7 +330,7 @@ async function action(method, params = {}, callId) {
   if (method === 'session/connect') {
     const focus = sessionFocus;
     if (!focus || focus.revision !== params.revision || !focus.workdir) throw new Error('对话已切换，请读取当前对话的项目。');
-    const result = await node('repo/snapshot', { dir: focus.workdir });
+    const result = await node('session/repository', { dir: focus.workdir, rootOnly: params.rootOnly === true });
     // 同项目换对话时面板复用这次读取；只有项目真的换了才丢弃结果。
     if (!sessionFocus?.workdir || workdirKey(sessionFocus.workdir) !== workdirKey(focus.workdir)) throw new Error('对话已切换，请读取当前对话的项目。');
     // Automatic follow must not overwrite manually saved repositories or broadcast a switch.
@@ -372,6 +399,10 @@ channel.onmessage = ({ data: m }) => {
   });
 };
 cindy.onHostMessage(async msg => {
+  if (msg.type === 'ui-consumers') {
+    await syncWarningConsumers(msg.consumers || []);
+    return;
+  }
   if (msg.type === 'event' && msg.name === 'did-turn-end') {
     updateConfig(latest => {
       const normalized = normalizeUsage(latest.usage);
@@ -442,3 +473,7 @@ cindy.onHostMessage(async msg => {
     await cindy.send({ type: 'tool-result', callId: msg.callId, ok: true, result });
   } catch (e) { await cindy.send({ type: 'tool-result', callId: msg.callId, ok: false, errorCode: 'GIT_FLOW_FAILED', message: e.message }); }
 });
+// Restore already-mounted composer headers if the background page was restarted.
+if (cindy.ping) void cindy.ping().then(reply => {
+  if (!warningConsumers.length) return syncWarningConsumers(reply.nativeUiConsumers || []);
+}).catch(() => {});

@@ -9,12 +9,12 @@ async function git(dir, args, options = {}) {
   try {
     const { stdout } = await run('git', ['--no-pager', '-c', 'core.quotepath=false', '-c', 'core.fsmonitor=false', '-C', dir, ...args], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 15000,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }, ...options
+      ...options, env: { ...process.env, ...options.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
     });
     return stdout;
   } catch (e) {
     const error = new Error(gitError(e, args.includes('fetch')));
-    error.code = e.code;
+    error.code = args.includes('--show-toplevel') && e.code === 128 && /fatal: not a git repository\b/i.test(e.stderr || '') ? 'NOT_GIT_REPO' : e.code;
     throw error;
   }
 }
@@ -22,7 +22,7 @@ async function optional(dir, args) { try { return (await git(dir, args)).trim();
 async function root(dir) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('请选择本机仓库文件夹。');
   const base = await fs.realpath(dir);
-  return (await git(base, ['rev-parse', '--show-toplevel'])).trim();
+  return (await git(base, ['rev-parse', '--show-toplevel'], { env: { LC_ALL: 'C' } })).trim();
 }
 function canonicalRemote(raw) {
   try {

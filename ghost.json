@@ -223,6 +223,13 @@
     ]
   },
   "command": "git-flow",
+  "mcpApps": {
+    "host": {
+      "contributions": [
+        { "id": "repository-warning", "title": "Git 仓库提示", "kind": "status", "position": "composer.header" }
+      ]
+    }
+  },
   "panel": {
     "title": "Git 流线",
     "html": "panel.html",

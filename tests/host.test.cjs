@@ -9,6 +9,25 @@ function host(readFailure = false, model = null, nodeImpl = null, initialConfig 
  async function result(id){for(let i=0;i<100;i++){const m=messages.find(m=>m.id===id&&m.type==='response');if(m)return m;await new Promise(r=>setTimeout(r,5));}throw new Error('response timeout');}
  return{request,result,listener,messages,calls,context,get config(){return cfg;}};
 }
+test('composer warning targets the focused session and disappears after expiry',async()=>{
+ const h=host(),updates=[];
+ let expire;
+ h.context.clearTimeout=()=>{};
+ const originalTimeout=h.context.setTimeout;
+ h.context.setTimeout=(fn,ms)=>ms===6200?(expire=fn,1):originalTimeout(fn,ms);
+ h.context.cindy.ui={updateContribution:(id,build,target)=>updates.push({id,...build(),...target})};
+ await h.listener({type:'event',name:'did-session-switched',data:{sessionId:'target',workdir:'/other'}});
+ await h.listener({type:'ui-consumers',consumers:[{id:'repository-warning',sessionId:'target',clientId:'window-a'}]});
+ assert.equal(updates.pop().visible,false);
+ h.request('wrong','ui/repository-warning',{sessionId:'old',revision:1,text:'wrong'});
+ await h.result('wrong');assert.equal(updates.length,0);
+ h.request('right','ui/repository-warning',{sessionId:'target',revision:1,text:'跨仓库引用'});
+ assert.equal((await h.result('right')).result,true);
+ assert.deepEqual(updates.pop(),{id:'repository-warning',title:'跨仓库引用',visible:true,sessionId:'target',clientId:'window-a'});
+ await h.listener({type:'ui-consumers',consumers:[{id:'repository-warning',sessionId:'target',clientId:'window-a'},{id:'repository-warning',sessionId:'other',clientId:'window-b'}]});
+ assert.deepEqual(updates.pop(),{id:'repository-warning',visible:false,sessionId:'other',clientId:'window-b'});
+ expire();assert.equal(updates.pop().visible,false);
+});
 test('concurrent per-repository settings preserve disabled sharing and unrelated updates',async()=>{
  const h=host();h.request('1','config/update',{teamRepo:{dir:'/repo-b',enabled:true,room:'b'}});h.request('2','config/update',{displayName:'Alice'});h.request('3','config/update',{teamRepo:{dir:'/repo-c',enabled:true,room:'c'}});
  await Promise.all(['1','2','3'].map(id=>h.result(id)));assert.equal(h.config.teamRepos['/repo-a'].enabled,false);assert.equal(h.config.teamRepos['/repo-b'].room,'b');assert.equal(h.config.teamRepos['/repo-c'].room,'c');assert.equal(h.config.displayName,'Alice');

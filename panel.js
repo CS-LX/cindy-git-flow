@@ -45,6 +45,16 @@ const workdirKey = value => typeof value === 'string' ? value.replace(value.star
 let repositoryLocked = false, lockSaving = false, configReady = false, pendingFocus = null;
 let graph = null, selected = null, controlsCollapsed = false, collapseSaving = false;
 const short = sha => sha ? sha.slice(0, 7) : '尚无提交';
+// Capture the worktree at render time, independent of the conversation at drop time.
+function referenceAttributes(sourceDir, sha) {
+  if (!sourceDir || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) return '';
+  const reference = 'Git 提交 ' + sha + '（来源仓库：' + JSON.stringify(sourceDir) + '）';
+  return ' draggable="true" data-commit-reference="' + escapeHtml(reference) + '"';
+}
+function referenceButton(sourceDir, sha) {
+  const attrs = referenceAttributes(sourceDir, sha);
+  return attrs ? '<button class="text-button" data-copy-reference' + attrs + ' title="复制引用，或拖到对话输入框">复制提交引用</button>' : '';
+}
 function age(value) {
   if (!value) return '未知';
   const seconds = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000);
@@ -249,10 +259,42 @@ function clearRepository(title, message) {
   $('#welcome-title').textContent = title; $('#welcome-message').textContent = message;
   applyControls(false); error(''); options(); render();
 }
+let toastTimer, lastToastRevision = -1;
+function showSessionToast(message) {
+  if (!activeFocus || lastToastRevision === lastFocusRevision) return;
+  lastToastRevision = lastFocusRevision;
+  clearTimeout(toastTimer);
+  const toast = $('#session-toast');
+  toast.hidden = true;
+  void toast.offsetWidth; // Restart the entrance animation even for consecutive warnings.
+  toast.textContent = message;
+  toast.hidden = false;
+  toastTimer = setTimeout(() => { toast.hidden = true; }, 6200);
+  if (activeFocus?.sessionId) {
+    void rpc('ui/repository-warning', { sessionId: activeFocus.sessionId, revision: lastFocusRevision,
+      text: '⚠ ' + message }).catch(() => {}); // The panel also works on hosts without composer contributions.
+  }
+}
 async function followConversation(focus, revision = focus?.revision, force = false) {
   if (!Number.isInteger(revision) || revision < lastFocusRevision || (revision === lastFocusRevision && !force)) return;
+  if (revision !== lastFocusRevision) {
+    clearTimeout(toastTimer);
+    $('#session-toast').hidden = true;
+  }
   lastFocusRevision = revision; activeFocus = focus;
-  if (repositoryLocked) { followingSession = false; renderFollow(); return; }
+  if (focus && !focus.workdir) showSessionToast('当前对话没有关联本机目录。');
+  if (repositoryLocked) {
+    followingSession = false;
+    renderFollow();
+    if (focus?.workdir && workdirKey(focus.workdir) !== workdirKey(dir)) {
+      try {
+        const result = await rpc('session/connect', { revision, rootOnly: true });
+        if (revision === lastFocusRevision && repositoryLocked && result?.outsideRepository)
+          showSessionToast('当前对话不在 Git 仓库中。流线仍显示锁定的仓库。');
+      } catch { /* An unreadable directory does not establish that it is outside Git. */ }
+    }
+    return;
+  }
   followingSession = true;
   const nextWorkdir = workdirKey(focus?.workdir);
   // 换的是对话，仓库没换：保留图、滚动位置、选中项、搜索和详情。
@@ -278,6 +320,12 @@ async function connect(nextDir, pick = false, mode = 'manual', focus = activeFoc
   try {
     const data = await rpc(mode === 'follow' ? 'session/connect' : pick ? 'repo/pick' : 'repo/connect', mode === 'follow' ? { revision: focus.revision } : pick ? {} : { dir: nextDir });
     if (revision !== generation) return;
+    if (mode === 'follow' && data?.outsideRepository) {
+      $('#welcome-title').textContent = '当前对话不在 Git 仓库中';
+      $('#welcome-message').textContent = '可以手动选择仓库，或切换到仓库中的对话。';
+      showSessionToast('当前对话不在 Git 仓库中。');
+      return;
+    }
     if (!data) { followingSession = previousFollowing; options(); render(); return; }
     const latest = await rpc('config/read');
     if (revision !== generation) return;
@@ -481,7 +529,7 @@ function renderGraph() {
     const head = row.sha === headSha(), folded = !!row.auto?.folded;
     const hint = folded ? '连续 ' + row.auto.count + ' 条自动同步快照，点击挑选一条查看改动' : row.auto ? '自动同步快照 · 提交作者：' + row.author : '提交作者：' + row.author + '（提交时填写的 Git 姓名，不是账号认证）';
     const when = folded ? autoRange(row) : age(row.date);
-    return '<button class="commit-row' + (head ? ' head' : '') + (row.auto ? ' auto' : '') + (folded ? ' folded' : '') + '" data-sha="' + row.sha + '" title="' + escapeHtml(row.auto ? row.subject : subjectLabel(row.subject)) + '"><div class="commit-title">' + escapeHtml(row.auto ? autoTitle(row) : subjectLabel(row.subject)) + '</div><div class="commit-meta">' + chips(row, 2) + '<span class="author" title="' + escapeHtml(hint) + '">' + escapeHtml(row.author || '') + '</span><span class="dot">·</span><span class="when">' + escapeHtml(when || '') + '</span></div></button>';
+    return '<button class="commit-row' + (head ? ' head' : '') + (row.auto ? ' auto' : '') + (folded ? ' folded' : '') + '"' + referenceAttributes(dir, row.sha) + ' data-sha="' + row.sha + '" title="' + escapeHtml(row.auto ? row.subject : subjectLabel(row.subject)) + '"><div class="commit-title">' + escapeHtml(row.auto ? autoTitle(row) : subjectLabel(row.subject)) + '</div><div class="commit-meta">' + chips(row, 2) + '<span class="author" title="' + escapeHtml(hint) + '">' + escapeHtml(row.author || '') + '</span><span class="dot">·</span><span class="when">' + escapeHtml(when || '') + '</span></div></button>';
   }).join('');
   const elements = [...host.querySelectorAll('.commit-row')];
   elements.forEach((el, i) => el.style.setProperty('--indent', Math.round(x(graph.reach[i]) + 16 - 8) + 'px'));
@@ -576,13 +624,13 @@ function renderSheet() {
       '<div class="sheet-meta"><span>自动同步快照</span><span>' + escapeHtml(autoRange(row)) + '</span>' + (head ? '<span>当前提交</span>' : '') + '</div>' +
       (refs.length ? '<div class="sheet-refs">' + chips(row, 6) + '</div>' : '') +
       '<p class="auto-note">每次构建都会留下一条快照，默认折成一行。点任意一条查看它的改动；不想折叠可以在「远端与显示」里关闭。</p>' +
-      '<div class="auto-list">' + row.auto.members.map(m => '<button class="auto-item" data-commit="' + m.sha + '" title="' + escapeHtml(m.subject) + '"><span class="mono">' + short(m.sha) + '</span><span class="auto-time">' + escapeHtml(clock(m.date)) + '</span></button>').join('') + '</div>';
+      '<div class="auto-list">' + row.auto.members.map(m => '<button class="auto-item"' + referenceAttributes(dir, m.sha) + ' data-commit="' + m.sha + '" title="' + escapeHtml(m.subject) + '"><span class="mono">' + short(m.sha) + '</span><span class="auto-time">' + escapeHtml(clock(m.date)) + '</span></button>').join('') + '</div>';
     return;
   }
   sheet.innerHTML = '<div class="sheet-head"><div class="sheet-title">' + escapeHtml(row.auto ? autoTitle(row) : subjectLabel(row.subject)) + '</div><button class="icon-button" data-sheet="close" title="关闭" aria-label="关闭">' + icon('close') + '</button></div>' +
     '<div class="sheet-meta"><span>提交作者：' + escapeHtml(row.author) + '</span><span>' + age(row.date) + '</span><span class="mono" title="提交编号：这条记录的唯一标识">编号 ' + short(row.sha) + '</span>' + (row.parents.length > 1 ? '<span>合并提交</span>' : '') + (row.auto ? '<span>构建自动生成</span>' : '') + '</div>' +
     (refs.length || head ? '<div class="sheet-refs">' + chips(row, 6) + '</div>' : '') +
-    (row.auto ? '' : originalSubject(row.subject)) + '<div class="sheet-actions"><button class="main" data-sheet="detail" title="查看这次提交修改了哪些文件和代码">查看改动</button>' + (head ? '' : '<button data-sheet="compare" title="只查看提交数量和文件差异，不执行合并或切换">和当前分支比较</button>') + '</div>';
+    (row.auto ? '' : originalSubject(row.subject)) + '<div class="sheet-actions"><button class="main" data-sheet="detail" title="查看这次提交修改了哪些文件和代码">查看改动</button>' + referenceButton(dir, row.sha) + (head ? '' : '<button data-sheet="compare" title="只查看提交数量和文件差异，不执行合并或切换">和当前分支比较</button>') + '</div>';
 }
 
 function branchRefs(remote) { return (state?.refs || []).filter(r => r.remote === remote); }
@@ -933,6 +981,7 @@ function patchBody(text) {
   }).filter(Boolean).join('') + '</pre>';
 }
 async function showCommit(sha) {
+  const sourceDir = dir;
   // 折叠行是面板合成的行，不是真实提交，不能拿去读补丁。
   if (String(sha || '').startsWith('auto:')) return;
   const row = graph?.rows.find(r => r.sha === sha);
@@ -946,7 +995,7 @@ async function showCommit(sha) {
       activeCommitSubject = match?.[1] || '';
       if (activeCommitSubject) $('#detail-title').textContent = subjectLabel(activeCommitSubject);
     }
-    $('#detail-body').innerHTML = patchHead(split < 0 ? data.patch : data.patch.slice(0, split), row) + (split < 0 ? '' : patchBody(data.patch.slice(split + 1))) + (data.truncated ? '<p class="empty">补丁太长，只显示了前 180,000 字符。</p>' : '');
+    $('#detail-body').innerHTML = referenceButton(sourceDir, sha) + patchHead(split < 0 ? data.patch : data.patch.slice(0, split), row) + (split < 0 ? '' : patchBody(data.patch.slice(split + 1))) + (data.truncated ? '<p class="empty">补丁太长，只显示了前 180,000 字符。</p>' : '');
     for (const bar of $('#detail-body').querySelectorAll('[data-w]')) bar.style.width = bar.dataset.w + '%';
     translatePending();
   } catch (e) { if (rev === detailRevision) $('#detail-body').innerHTML = '<p class="empty">' + escapeHtml(e.message) + '</p>'; }
@@ -1151,6 +1200,47 @@ $('#graph').onkeydown = event => {
   const next = geometry.elements[Math.max(0, Math.min(geometry.elements.length - 1, i + (event.key === 'ArrowDown' ? 1 : -1)))];
   if (next) { event.preventDefault(); next.focus(); select(next.dataset.sha, true); }
 };
+document.addEventListener('dragstart', event => {
+  const item = event.target.closest?.('[data-commit-reference]');
+  if (!item || !event.dataTransfer) return;
+  event.dataTransfer.effectAllowed = 'copy';
+  event.dataTransfer.setData('text/plain', item.dataset.commitReference);
+});
+// A panel may lack async clipboard permission but still receive a user-initiated copy event.
+document.addEventListener('copy', event => {
+  const button = document.activeElement?.closest?.('[data-copy-reference][data-await-copy]');
+  if (!button || !event.clipboardData) return;
+  event.clipboardData.setData('text/plain', button.dataset.commitReference);
+  event.preventDefault();
+  delete button.dataset.awaitCopy;
+  button.textContent = '已复制';
+});
+document.addEventListener('focusout', event => {
+  const button = event.target.closest?.('[data-copy-reference][data-await-copy]');
+  if (!button) return;
+  delete button.dataset.awaitCopy;
+  button.textContent = '复制提交引用';
+});
+document.addEventListener('click', async event => {
+  const button = event.target.closest?.('[data-copy-reference]');
+  if (!button) return;
+  button.focus({ preventScroll: true });
+  button.dataset.awaitCopy = 'true';
+  // Keep the copy command inside the original click, before any asynchronous permission check.
+  try {
+    if (document.execCommand?.('copy') && !button.dataset.awaitCopy) return;
+  } catch {
+    // Try the async clipboard API when the command is unavailable.
+  }
+  try {
+    await navigator.clipboard.writeText(button.dataset.commitReference);
+    delete button.dataset.awaitCopy;
+    button.textContent = '已复制';
+  } catch {
+    if (document.activeElement !== button) return;
+    button.textContent = /Mac/.test(navigator.platform) ? '按 ⌘C 复制' : '按 Ctrl+C 复制';
+  }
+});
 $('#sheet').onclick = event => {
   const member = event.target.closest('[data-commit]');
   if (member) return showCommit(member.dataset.commit);
