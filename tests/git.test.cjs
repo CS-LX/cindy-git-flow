@@ -6,6 +6,9 @@ const os = require('node:os');
 const path = require('node:path');
 const repo = require('../node/git.cjs');
 const { layout } = require('../graph.js');
+// Windows cannot create symlinks without developer mode/admin, and NTFS forbids
+// tab/newline in file names. Those two fixtures are POSIX-only by nature.
+const windows = process.platform === 'win32';
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(),'git-flow-test-'));
   t.after(()=>fs.rm(dir,{recursive:true,force:true}));
@@ -239,10 +242,15 @@ test('workspace previews cover scopes, unborn HEAD, literal paths and path bound
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'git-flow-outside-'));
   t.after(() => fs.rm(outside, { recursive: true, force: true }));
   await fs.writeFile(path.join(outside, 'secret'), 'private');
-  await fs.symlink(path.join(outside, 'secret'), path.join(dir, 'link'));
-  await fs.symlink(outside, path.join(dir, 'outside'));
-  await assert.rejects(repo.workspace(dir, { path: 'link', scope: 'untracked' }));
-  await assert.rejects(repo.workspace(dir, { path: 'outside/secret', scope: 'untracked' }));
+  let symlinks = true;
+  try {
+    await fs.symlink(path.join(outside, 'secret'), path.join(dir, 'link'));
+    await fs.symlink(outside, path.join(dir, 'outside'));
+  } catch { symlinks = false; }
+  if (symlinks) {
+    await assert.rejects(repo.workspace(dir, { path: 'link', scope: 'untracked' }));
+    await assert.rejects(repo.workspace(dir, { path: 'outside/secret', scope: 'untracked' }));
+  }
   assert.equal((await repo.workspace(dir, { path: ':(glob)**' })).patch, '');
   const unborn = await fixture(t);
   await fs.writeFile(path.join(unborn, 'new'), 'staged\n');
@@ -259,7 +267,7 @@ test('stash detail combines tracked and -u files, including binary and unusual f
   const dir = await fixture(t);
   await commit(dir, 'tracked', 'old\n', 'base');
   await fs.writeFile(path.join(dir, 'tracked'), 'changed\n');
-  const unusual = 'new 空格\tline\n.txt';
+  const unusual = windows ? 'new 空格 line.txt' : 'new 空格\tline\n.txt';
   await fs.writeFile(path.join(dir, unusual), 'new\nlines\n');
   await fs.writeFile(path.join(dir, 'binary'), Buffer.from([0, 1, 2]));
   await repo.git(dir, ['stash', 'push', '-u', '-m', 'backup']);

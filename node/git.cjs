@@ -22,7 +22,9 @@ async function optional(dir, args) { try { return (await git(dir, args)).trim();
 async function root(dir) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('请选择本机仓库文件夹。');
   const base = await fs.realpath(dir);
-  return (await git(base, ['rev-parse', '--show-toplevel'])).trim();
+  // git prints forward slashes on Windows (`C:/...`). Normalizing here keeps every
+  // later containment check on the same separator as path.sep and realpath.
+  return path.resolve((await git(base, ['rev-parse', '--show-toplevel'])).trim());
 }
 function canonicalRemote(raw) {
   try {
@@ -58,15 +60,23 @@ function parseNumstat(raw) {
   }
   return files;
 }
+// Containment must not depend on string separators: compare with path.relative so
+// `C:/repo` and `C:\repo` agree, and reject nothing but strict descendants.
+function insideRepository(dir, target) {
+  const relative = path.relative(dir, target);
+  return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
 function workspacePath(dir, name) {
-  if (typeof name !== 'string' || !name || name.includes('\0') || path.isAbsolute(name) || !path.resolve(dir, name).startsWith(dir + path.sep)) throw new Error('请选择仓库内的有效相对文件路径。');
-  return path.resolve(dir, name);
+  if (typeof name !== 'string' || !name || name.includes('\0') || path.isAbsolute(name)) throw new Error('请选择仓库内的有效相对文件路径。');
+  const target = path.resolve(dir, name);
+  if (!insideRepository(dir, target)) throw new Error('请选择仓库内的有效相对文件路径。');
+  return target;
 }
 async function readWorkspaceFile(dir, name, maxBytes, skipLarge = false) {
   const target = workspacePath(dir, name);
   const stat = await fs.lstat(target);
   if (!stat.isFile()) throw new Error('只能预览普通文件。');
-  if (!(await fs.realpath(target)).startsWith(dir + path.sep)) throw new Error('文件路径超出仓库范围。');
+  if (!insideRepository(dir, await fs.realpath(target))) throw new Error('文件路径超出仓库范围。');
   if (skipLarge && stat.size > maxBytes) return { data: Buffer.alloc(0), truncated: true };
   const file = await fs.open(target, require('node:fs').constants.O_RDONLY | require('node:fs').constants.O_NOFOLLOW);
   try {
