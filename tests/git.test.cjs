@@ -90,6 +90,22 @@ test('当前分支读取自己的历史，其他分支超过 180 条也不丢失
   const empty = await repo.snapshot(dir); assert(empty.commits.length > 0); assert.deepEqual(empty.currentCommits, []);
 });
 
+test('Cindy session savepoints stay out of the graph unless reachable from project history', async t => {
+  const dir = await fixture(t);
+  const base = await commit(dir, 'file', 'base', 'base');
+  const tree = base + '^{tree}';
+  const baseline = (await repo.git(dir, ['commit-tree', tree, '-m', 'baseline'])).trim();
+  const saved = (await repo.git(dir, ['commit-tree', tree, '-p', baseline, '-m', 'saved'])).trim();
+  await repo.git(dir, ['update-ref', 'refs/cindy/savepoints/test-session', saved]);
+
+  const before = await repo.snapshot(dir);
+  assert.deepEqual(before.commits.map(c => c.sha), [base]);
+
+  await repo.git(dir, ['tag', 'keep-baseline', baseline]);
+  const after = await repo.snapshot(dir);
+  assert.deepEqual(new Set(after.commits.map(c => c.sha)), new Set([base, baseline]));
+});
+
 test('stash entries stay separate, including older and untracked stashes; normal refs retain shared objects', async t => {
   const dir = await fixture(t);
   const base = await commit(dir, 'file', 'base', 'base');

@@ -148,9 +148,9 @@ async function snapshot(input, attempt = 0) {
   };
   // Read HEAD history separately: filtering the global 180 rows would lose older current-branch commits.
   const [commits, currentCommits] = await Promise.all([
-    // Exclude only the traversal root: stash objects also reachable through
+    // Exclude internal traversal roots only: commits also reachable through
     // a normal ref or HEAD must remain visible.
-    readLog(['--exclude=refs/stash', '--all', ...(startHead ? [startHead] : [])]),
+    readLog(['--exclude=refs/stash', '--exclude=refs/cindy/savepoints/*', '--all', ...(startHead ? [startHead] : [])]),
     startHead ? readLog([startHead]) : []
   ]);
   const current = refs.find(r => r.full === 'refs/heads/' + branch);
