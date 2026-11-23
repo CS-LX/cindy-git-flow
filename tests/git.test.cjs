@@ -16,6 +16,18 @@ async function fixture(t) {
   return dir;
 }
 async function commit(dir,file,text,message) { await fs.writeFile(path.join(dir,file),text); await repo.git(dir,['add','--',file]); await repo.git(dir,['commit','-m',message]); return (await repo.git(dir,['rev-parse','HEAD'])).trim(); }
+test('session repository detection distinguishes non-repositories, nested paths and read failures', async t => {
+  const { handle } = require('../node/service.cjs');
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(),'git-flow-outside-'));
+  t.after(() => fs.rm(outside,{recursive:true,force:true}));
+  for (const rootOnly of [true,false]) {
+    assert.deepEqual(await handle('session/repository',{dir:outside,rootOnly}),{outsideRepository:true});
+    await assert.rejects(handle('session/repository',{dir:path.join(outside,'missing'),rootOnly}),{code:'ENOENT'});
+  }
+  const dir = await fixture(t), sub = path.join(dir,'nested');
+  await fs.mkdir(sub);
+  assert.equal((await handle('session/repository',{dir:sub,rootOnly:true})).dir,await repo.root(dir));
+});
 test('empty repo, unicode file, staged rename and detached HEAD',async t=>{
   const dir=await fixture(t); let s=await repo.snapshot(dir);assert.equal(s.unborn,true);assert.equal(s.branch,'main');assert.deepEqual(s.commits,[]);
   await commit(dir,'名字 with spaces.txt','hello','首次提交');

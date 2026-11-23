@@ -3,6 +3,14 @@ const repo = require('./git.cjs');
 const team = require('./team.cjs');
 const github = require('./github.cjs');
 async function handle(method, p, secrets = {}, notify = () => {}) {
+  if (method === 'session/repository') {
+    try {
+      return p.rootOnly ? { dir: await repo.root(p.dir) } : await repo.snapshot({ dir: p.dir });
+    } catch (e) {
+      if (e.code === 'NOT_GIT_REPO') return { outsideRepository: true };
+      throw e;
+    }
+  }
   if (method === 'repo/snapshot') return repo.snapshot({ dir: p.dir, limit: p.limit });
   if (method === 'repo/detail') return repo.detail(p.dir, p.ref);
   if (method === 'repo/workspace-diff') return repo.workspaceDiff({ dir: p.dir }, p.limit);

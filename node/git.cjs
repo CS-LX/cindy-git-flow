@@ -9,12 +9,12 @@ async function git(dir, args, options = {}) {
   try {
     const { stdout } = await run('git', ['--no-pager', '-c', 'core.quotepath=false', '-c', 'core.fsmonitor=false', '-C', dir, ...args], {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 15000,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }, ...options
+      ...options, env: { ...process.env, ...options.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
     });
     return stdout;
   } catch (e) {
     const error = new Error(gitError(e, args.includes('fetch')));
-    error.code = e.code;
+    error.code = args.includes('--show-toplevel') && e.code === 128 && /fatal: not a git repository\b/i.test(e.stderr || '') ? 'NOT_GIT_REPO' : e.code;
     throw error;
   }
 }
@@ -24,7 +24,8 @@ async function root(dir) {
   const base = await fs.realpath(dir);
   // git prints forward slashes on Windows (`C:/...`). Normalizing here keeps every
   // later containment check on the same separator as path.sep and realpath.
-  return path.resolve((await git(base, ['rev-parse', '--show-toplevel'])).trim());
+  // LC_ALL=C keeps the "not a git repository" message matchable for NOT_GIT_REPO.
+  return path.resolve((await git(base, ['rev-parse', '--show-toplevel'], { env: { LC_ALL: 'C' } })).trim());
 }
 function canonicalRemote(raw) {
   try {

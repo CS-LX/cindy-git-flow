@@ -8,6 +8,7 @@ test('local flow and workspace typography never falls below the panel text scale
  assert.match(css,/\.ws-patch\s*\{[^}]*font-size:\s*12px/);
 });
 function panel(impl) {
+ const handlers = new Map();
  const nodes=new Map(),calls=[];
  function element(key) {
   if(nodes.has(key))return nodes.get(key);
@@ -22,12 +23,87 @@ function panel(impl) {
    }
   }});nodes.set(key,el);return el;
  }
- const context=vm.createContext({console,TextEncoder,TextDecoder,Uint8Array,setTimeout,clearTimeout,document:{hidden:false,querySelector:element,querySelectorAll:()=>[],addEventListener(){}},GitFetchSchedule:{FetchSchedule:class{}},GitChoices:{close(){},set(){}},GitBridge:{request:async(method,params)=>{calls.push({method,params});return impl?impl(method,params):{patch};}}});
+ const context=vm.createContext({console,TextEncoder,TextDecoder,Uint8Array,setTimeout,clearTimeout,document:{hidden:false,querySelector:element,querySelectorAll:()=>[],addEventListener(type,handler){handlers.set(type,handler);}},GitFetchSchedule:{FetchSchedule:class{}},GitChoices:{close(){},set(){}},GitBridge:{request:async(method,params)=>{calls.push({method,params});return impl?impl(method,params):{patch};}}});
  for(const file of ['labels.js','timeline.js'])vm.runInContext(fs.readFileSync(require.resolve('../'+file),'utf8'),context);
  vm.runInContext(fs.readFileSync(require.resolve('../panel.js'),'utf8').split('GitBridge.on(async message =>')[0],context);
  vm.runInContext("dir='/repo'; config={motion:false}; state={dir,branch:'main',head:'abcdef123456',upstream:'origin/main',upstreamExists:true,ahead:0,behind:0,refs:[],remotes:[],commits:[{sha:'abcdef123456',subject:'fix(ui): 修复界面层级',parents:[],author:'test'}],stashes:[{sha:'stash-sha',subject:'On main: local-upgrade-20261120-preserve-existing-work',date:'2026-11-20T00:00:00Z'}],status:{count:4,staged:1,unstaged:1,untracked:1,conflicts:1,additions:35,deletions:7,files:[{path:'panel.js',status:'MM',add:30,remove:7,stagedAdd:20,stagedRemove:5,unstagedAdd:10,unstagedRemove:2},{path:'tests/new.test.cjs',status:'??',untracked:true,add:5,remove:0},{path:'node/conflict.cjs',status:'UU',conflict:true},{path:'old.txt',status:'D.'}]}};showPreferences=()=>{};renderScope=()=>{};renderRemote=()=>{};renderAttention=()=>{};",context);
- return{run:s=>vm.runInContext(s,context),element,calls,context};
+ return{run:s=>vm.runInContext(s,context),element,calls,context,handlers};
 }
+test('drag and copy preserve the source worktree after the conversation changes', async () => {
+ const p = panel(), sha = 'a'.repeat(40);
+ const attrs = p.run(`referenceAttributes('/source worktree', '${sha}')`);
+ const reference = attrs.match(/data-commit-reference="([^"]+)"/)[1].replaceAll('&quot;', '"');
+ assert.equal(reference, 'Git 提交 ' + sha + '（来源仓库："/source worktree"）');
+ assert.equal(p.run(`referenceAttributes('/source worktree', 'auto:${sha}')`), '');
+ p.run("dir='/other repository'");
+ const item = {dataset:{commitReference:reference},focus(){}};
+ const target = {closest:() => item};
+ const payload = new Map();
+ p.handlers.get('dragstart')({target,dataTransfer:{setData:(type,value) => payload.set(type,value)}});
+ assert.deepEqual([...payload], [['text/plain',reference]]);
+ let copied;
+ p.context.navigator = {clipboard:{writeText:async value => {copied=value;}}};
+ await p.handlers.get('click')({target});
+ assert.equal(copied,reference);
+});
+test('commit transfers use the captured source while focus and panel repositories change', async () => {
+ const p=panel(), drag=p.handlers.get('dragstart'), click=p.handlers.get('click');
+ const copied=[];
+ p.context.navigator={clipboard:{writeText:async text=>{copied.push(text);}}};
+ for(let i=0;i<500;i++){
+   const sha=i.toString(16).padStart(40,'0'), source='/worktree '+(i%5);
+   const attrs=p.run(`referenceAttributes(${JSON.stringify(source)}, '${sha}')`);
+   const text=attrs.match(/data-commit-reference="([^"]+)"/)[1].replaceAll('&quot;','"');
+   p.context.nextFocus=i%3?{workdir:i%2?source:'/other'}:null;
+   p.run("activeFocus=nextFocus; lastFocusRevision++; dir='/switched'");
+   const item={dataset:{commitReference:text},focus(){}},target={closest:()=>item};
+   const expected='Git 提交 '+sha+'（来源仓库：'+JSON.stringify(source)+'）';
+   let dragged;
+   drag({target,dataTransfer:{setData:(type,value)=>{assert.equal(type,'text/plain');dragged=value;}}});
+   await click({target});
+   assert.equal(dragged,expected);assert.equal(copied[i],expected);
+ }
+ assert.equal(p.calls.length,0);
+});
+test('blocked async clipboard keeps the button and copies only its own reference on Ctrl+C', async () => {
+ const p = panel(), button = {dataset:{commitReference:'reference from worktree A'},focus(){}};
+ p.context.navigator = {platform:'Win32',clipboard:{writeText:async () => {throw Error('denied');}}};
+ button.closest = () => button.dataset.awaitCopy ? button : null;
+ p.context.document.activeElement = button;
+ const payload = new Map();
+ const copy = () => p.handlers.get('copy')({clipboardData:{setData:(k,v)=>payload.set(k,v)},preventDefault(){}});
+ await p.handlers.get('click')({target:{closest:()=>button}});
+ assert.equal(button.textContent,'按 Ctrl+C 复制');
+ copy();
+ assert.deepEqual([...payload],[['text/plain','reference from worktree A']]);
+ assert.equal(button.textContent,'已复制');
+ payload.clear(); copy(); assert.equal(payload.size,0);
+ p.context.document.execCommand = command => {assert.equal(command,'copy');copy();return true;};
+ await p.handlers.get('click')({target:{closest:()=>button}});
+ assert.equal(payload.get('text/plain'),button.dataset.commitReference);
+ assert.equal(button.textContent,'已复制');
+});
+test('locked panel warns only for the current non-repository session and keeps its source', async () => {
+ let finish;
+ const p = panel(() => new Promise(resolve => { finish = resolve; }));
+ const timers = [];
+ p.context.setTimeout = callback => { timers.push(callback); return timers.length; };
+ p.context.clearTimeout = () => {};
+ p.run('repositoryLocked=true; renderFollow=()=>{}');
+ const pending = p.run("followConversation({workdir:'/old', revision:1})");
+ await p.run("followConversation({workdir:'/repo', revision:2})");
+ finish({outsideRepository:true}); await pending;
+ assert.equal(timers.length,0);
+ const current = p.run("followConversation({workdir:'/outside', revision:3})");
+ finish({outsideRepository:true}); await current;
+ assert.match(p.element('#session-toast').textContent,/不在 Git 仓库/);
+ assert.equal(p.run('dir'),'/repo');
+ await p.run("followConversation({workdir:'/outside', revision:3})");
+ assert.equal(timers.length,1);
+ timers[0](); assert.equal(p.element('#session-toast').hidden,true);
+ await p.run("followConversation({workdir:null, revision:4})");
+ assert.match(p.element('#session-toast').textContent,/没有关联本机目录/);
+});
 test('compact backup pill replaces raw toolbar details; local flow stays distinct from history',()=>{
  const html=fs.readFileSync(require.resolve('../panel.html'),'utf8');assert(!html.includes('<details id="stash-entry"'));assert(html.includes('id="stash-pill"'));assert(html.indexOf('id="local-flow"')<html.indexOf('id="graph"'));
  const p=panel();p.run('renderStatus();renderLocalFlow()');assert(p.element('#stash-pill').innerHTML.includes('备份 <b>1</b>'));
