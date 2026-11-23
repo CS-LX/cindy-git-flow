@@ -1,5 +1,14 @@
 # 验证记录
 
+## 1.9.2 Windows 工作区路径修复（2026-11-23）
+
+- 现象：Windows 上未跟踪文件行数恒为 0、点击工作区文件看差异直接报「请选择仓库内的有效相对文件路径」、模型摘要的 `workspaceDiff` 漏掉未跟踪内容。macOS 全程正常，所以长期未暴露。
+- 根因：`git rev-parse --show-toplevel` 在 Windows 返回 `C:/...` 正斜杠，`root()` 原样返回；`workspacePath` / `readWorkspaceFile` 用 `path.resolve(dir,name).startsWith(dir + path.sep)` 校验，`path.sep` 是 `\`，仓库内文件被误判为越界。
+- 修复：`root()` 用 `path.resolve` 归一化分隔符；新增 `insideRepository(dir,target)` 用 `path.relative` 判断严格后代；`workspacePath` 与 `readWorkspaceFile` 改用它。产品侧不依赖字符串前缀比较。
+- 真实 Windows 复验（`node v24.17.0`、`git 2.54.0.windows.1`、`core.autocrlf=true`、代码页 936）：修复前 `main` 与 `pr-3` 均为 6 项失败且名单完全一致；修复后 139 项全过。实测未跟踪文件 `untrackedAdd` 由 0 恢复为真实行数，单文件 `repo/workspace` 不再报错。
+- 平台差异夹具：Windows 无开发者模式时无法创建符号链接，NTFS 不允许文件名含 `\t` / `\n`，这两处测试夹具按平台跳过，不影响产品行为。
+- `node --test tests/*.test.cjs`：macOS 139 项全过；Windows 139 项全过。
+
 ## Maker 构建唤醒提交自动折叠（2026-11-22）
 
 - `chore: wake maker build server` 与 `chore(build): wake maker build server`（含前导 emoji）在作者 `taptap-maker`、`Maker`、`TapCode Rollback` 或邮箱 `maker-mcp@local` / `@taptap.cn` / `@taptap.com` 时按自动同步识别并折叠；同名人工提交和普通代码改动保持普通提交。
