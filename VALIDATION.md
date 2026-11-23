@@ -1,5 +1,11 @@
 # 验证记录
 
+## 1.9.3 合并社区贡献（2026-11-23）
+
+- PR #2（CS-LX）：`git log --all` 前增加 `--exclude=refs/cindy/savepoints/*`。Cindy 每轮对话把工作区写成 `refs/cindy/savepoints/<session>`，即使用户没改文件也会生成提交，占掉「全仓库最近 180 条」的名额。分支、标签或 HEAD 仍能引用到的提交照常显示。合并后 140 项测试全过。
+- PR #3（CS-LX）：提交可拖入对话输入框或复制为引用，引用在渲染时绑定来源工作树路径与完整 SHA；新增 `session/repository` 的 `rootOnly` 只读查询，对话未关联本机目录或不在 Git 仓库时给出提示。
+- 冲突处理：PR #3 给 `root()` 加 `LC_ALL=C`（让「not a git repository」可匹配），与 1.9.2 的 `path.resolve` 归一化落在同一行，合并为 `path.resolve(...)` 并保留 `LC_ALL=C`。合并后 146 项测试全过。
+
 ## 1.9.2 Windows 工作区路径修复（2026-11-23）
 
 - 现象：Windows 上未跟踪文件行数恒为 0、点击工作区文件看差异直接报「请选择仓库内的有效相对文件路径」、模型摘要的 `workspaceDiff` 漏掉未跟踪内容。macOS 全程正常，所以长期未暴露。
