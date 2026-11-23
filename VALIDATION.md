@@ -5,6 +5,8 @@
 - PR #2（CS-LX）：`git log --all` 前增加 `--exclude=refs/cindy/savepoints/*`。Cindy 每轮对话把工作区写成 `refs/cindy/savepoints/<session>`，即使用户没改文件也会生成提交，占掉「全仓库最近 180 条」的名额。分支、标签或 HEAD 仍能引用到的提交照常显示。合并后 140 项测试全过。
 - PR #3（CS-LX）：提交可拖入对话输入框或复制为引用，引用在渲染时绑定来源工作树路径与完整 SHA；新增 `session/repository` 的 `rootOnly` 只读查询，对话未关联本机目录或不在 Git 仓库时给出提示。
 - 冲突处理：PR #3 给 `root()` 加 `LC_ALL=C`（让「not a git repository」可匹配），与 1.9.2 的 `path.resolve` 归一化落在同一行，合并为 `path.resolve(...)` 并保留 `LC_ALL=C`。合并后 146 项测试全过。
+- Windows 复验（`a8b7ee5`）：146 项、145 通过、0 失败、1 跳过（进程组超时项按平台跳过），与 macOS 一致。PR #2 的 savepoint 用例和 PR #3 的拖拽/复制用例均通过；真实行为抽查 `untrackedAdd= 2`、单文件 patch 包含未跟踪内容。
+- 市场：1.9.1 审核已于同日取消，1.9.3 提交审核（首次上传报 `UPLOAD_OBJECT_MISSING`，重新 prepare 后重试成功）。
 
 ## 1.9.2 Windows 工作区路径修复（2026-11-23）
 
